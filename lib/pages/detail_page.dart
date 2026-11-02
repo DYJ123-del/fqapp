@@ -1171,6 +1171,9 @@ class _DetailPageState extends State<DetailPage> {
           historyStore: widget.readerStore,
           chapters: _allChapters,
           startIndex: index,
+          // 详情页点「听书」和阅读页点「听书」是同一个用户意图：起播后按偏好
+          // 采用真人讲书（→ 多角色），否则这里进来永远是内置 TTS 默认音色。
+          adoptPreferredTone: true,
         ),
       );
     } finally {
@@ -1453,6 +1456,9 @@ class _DetailPageState extends State<DetailPage> {
         chapters: _allChapters,
         startIndex: startIndex,
         resumeSession: false,
+        // 听书详情页点章节（或「开始收听」）也是明确的听书意图，同样按偏好
+        // 采用真人讲书/多角色音色。
+        adoptPreferredTone: true,
       ),
       'manga' => ComicReaderPage(
         bookId: _contentId,
