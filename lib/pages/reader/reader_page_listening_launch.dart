@@ -233,6 +233,9 @@ extension _ReaderPageListeningLaunch on _ReaderPageState {
         // 沿用正在听的那个音色：不传的话播放页只能挑默认音色，
         // 「从本页播放」就会把真人讲书换成内置 TTS。
         initialToneId: _listeningToneId(),
+        // 阅读页点「听书」是用户明确的听书意图：允许起播后自动采用偏好音色
+        // （真人讲书 → 多角色）。其他入口不传，保持确定行为。
+        adoptPreferredTone: true,
         // A paragraph-anchored request always carries an explicit start:
         // Duration.zero means "this paragraph has no audio, begin at the
         // chapter opening" and must not fall back to saved history.

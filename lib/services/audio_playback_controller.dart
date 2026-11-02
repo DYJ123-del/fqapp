@@ -72,6 +72,10 @@ class _AudioPlaybackController extends ChangeNotifier
   /// 本本书设置阶段发起的那次 /tones 请求（[_prepareSettings] 里赋值）。
   /// 起播时的默认音色决策复用同一个 future，避免重复请求。
   Future<AudioExtras>? _extrasFuture;
+
+  /// 用户是否已经手动选过音色（音色面板 / 真人版本切换）。
+  /// 自动采用偏好音色只在 false 时生效，绝不覆盖用户的明确选择。
+  bool _toneUserSelected = false;
   SubtitleTrack _subtitles = SubtitleTrack.empty;
 
   /// 当前字幕轨是否由本地估算生成（服务端没有文稿时的兜底）。
@@ -240,8 +244,10 @@ class _AudioPlaybackController extends ChangeNotifier
   Future<void> _startFirstChapter() async {
     await _settingsReady;
     if (_closed || _chapters.isEmpty) return;
-    await _autoAdoptPreferredTone();
-    if (_closed || _chapters.isEmpty) return;
+    // 绝不等待 /tones 再起播：p09 回归测试要求「慢响应不能延迟首播」
+    // （test/review_fix_b12_test.dart 的两条用例）。首播一律用默认音色 `0`，
+    // 偏好音色在后台补齐后由 _lateAdoptPreferredTone 切换。
+    unawaited(_autoAdoptPreferredTone());
     await _openChapter(
       _index,
       restoreHistory: true,
@@ -257,25 +263,21 @@ class _AudioPlaybackController extends ChangeNotifier
   ///
   /// `_toneId != '0'` 说明 [_prepareSettings] 已经用过历史或外部指定的音色，
   /// 这种情况一律不动，尊重用户上次的选择。
+  ///
+  /// **不阻塞**：/tones 还没回来就交给 [_lateAdoptPreferredTone] 在后台等。
   Future<void> _autoAdoptPreferredTone() async {
+    if (!request.adoptPreferredTone) return;
     if (_closed || _toneId != '0') return;
-    // 复用 _prepareSettings 里已经发起的那次请求，避免重复打 /tones。
-    var loaded = _extras;
-    if (loaded.tones.isEmpty) {
-      try {
-        // 起播前的一次性决策：给 2.5s 让 /tones 回来（首次冷启动通常 300ms~1.5s）。
-        // 仍然是有界等待——拿不到就按默认音色起播，绝不无界拖住听书
-        // （p09 回归测试见 test/review_fix_b12_test.dart）。
-        loaded = await (_extrasFuture ?? _loadExtrasSafely()).timeout(
-          const Duration(milliseconds: 2500),
-        );
-      } catch (_) {
-        // 超时：先按默认音色起播，等 /tones 回来再补选（见 _lateAdoptPreferredTone）。
-        unawaited(_lateAdoptPreferredTone());
-        return;
-      }
+    if (_extras.tones.isEmpty) {
+      unawaited(_lateAdoptPreferredTone());
+      return;
     }
-    if (_closed) return;
+    await _applyPreferredTone(_extras);
+  }
+
+  /// 把偏好音色落地：真人讲书换书版本，多角色换 tone_id。
+  Future<void> _applyPreferredTone(AudioExtras loaded) async {
+    if (_closed || _toneId != '0') return;
     final byId = <String, AudioVoice>{
       for (final voice in _voices) voice.id: voice,
     };
@@ -292,15 +294,23 @@ class _AudioPlaybackController extends ChangeNotifier
     if (preferred == null) return;
     if (tones.narratorTones.any((tone) => tone.id == preferred.id)) {
       await _adoptNarratorVersion(preferred);
-    } else {
+    } else if (_toneId != preferred.id) {
       _update(() => _toneId = preferred.id);
+      // 播放器已经起来了，换音色要重开本章才能生效。
+      if (_chapters.isNotEmpty) {
+        unawaited(
+          _openChapter(_index, toneId: preferred.id, autoplay: _wantPlay),
+        );
+      }
     }
   }
 
-  /// /tones 超时后的补选：等它回来，若还在起播阶段（没怎么播）就切成真人版。
+  /// /tones 还没回来时的后台补选：等它到达，若用户还没实质开始听就切过去。
   ///
-  /// 只在"用户还没实质开始听"时动手，避免听到一半被换书跳到别处。
+  /// 这里是唯一会等待 /tones 的地方，且**不在起播路径上**——首播早已用默认
+  /// 音色开始（p09 回归：慢响应不得延迟首播）。
   Future<void> _lateAdoptPreferredTone() async {
+    if (!request.adoptPreferredTone) return;
     final future = _extrasFuture;
     if (future == null) return;
     AudioExtras loaded;
@@ -309,33 +319,12 @@ class _AudioPlaybackController extends ChangeNotifier
     } catch (_) {
       return;
     }
-    // 已经选过音色 / 已经播出一段 / 已换章 —— 都不再插手。
-    if (_closed || _toneId != '0') return;
+    // 给用户一点时间：如果他在这期间自己点了音色，就不再介入。
+    await Future<void>.delayed(const Duration(milliseconds: 1200));
+    if (_closed || _toneId != '0' || _toneUserSelected) return;
+    // 已经听了一段就不再打断，避免中途换书跳到别处。
     if (_position.value > const Duration(seconds: 20)) return;
-    final tones = loaded.tones;
-    if (tones.isEmpty) return;
-    if (!identical(_extras, loaded)) {
-      final byId = <String, AudioVoice>{
-        for (final voice in _voices) voice.id: voice,
-      };
-      _mergeToneVoices(loaded, byId);
-      _update(() {
-        _extras = loaded;
-        _voices = List.unmodifiable(byId.values);
-      });
-    }
-    if (tones.hasFixedTone) return;
-    final preferred = tones.preferred;
-    if (preferred == null) return;
-    if (tones.narratorTones.any((tone) => tone.id == preferred.id)) {
-      await _adoptNarratorVersion(preferred);
-    } else {
-      // 多角色 TTS：播放器已经起来，换音色要重开本章才能生效。
-      _update(() => _toneId = preferred.id);
-      if (_chapters.isNotEmpty) {
-        unawaited(_openChapter(_index, toneId: preferred.id, autoplay: _wantPlay));
-      }
-    }
+    await _applyPreferredTone(loaded);
   }
 
   /// 把播放上下文切到真人讲书版本。
@@ -1489,6 +1478,7 @@ class _AudioPlaybackController extends ChangeNotifier
       return;
     }
     var generation = _generation;
+    _toneUserSelected = true;
     _update(() => _switchingVersion = true);
     try {
       final chapters = await (request.directoryLoader ?? _defaultDirectory)(

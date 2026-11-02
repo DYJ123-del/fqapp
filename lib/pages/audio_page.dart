@@ -79,6 +79,13 @@ class AudioPage extends StatefulWidget {
   final double? initialRate;
   final bool autoplay;
 
+  /// 是否允许在起播后自动切到偏好音色（真人讲书 → 多角色）。
+  ///
+  /// 只由「阅读页 → 听书」这个入口打开：真人在番茄里是**另一本书**，自动切
+  /// 会改变 bookId 与进度归属，属于强副作用，不该在书架/详情页等入口默认发生
+  /// （测试也依赖默认 false 的确定性）。
+  final bool adoptPreferredTone;
+
   /// Paragraph anchor for chapters whose body carries no `<span start_time>`
   /// (plain-text 智能朗读 chapters): the reader cannot compute milliseconds,
   /// so it hands over the paragraph and the player resolves the spoken start
@@ -142,6 +149,7 @@ class AudioPage extends StatefulWidget {
     this.initialToneId,
     this.initialRate,
     this.autoplay = true,
+    this.adoptPreferredTone = false,
     this.resumeSession = true,
     this.cover = '',
     this.historyStore,
