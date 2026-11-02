@@ -23,8 +23,11 @@ class AudioSkipPointsRows extends StatelessWidget {
   });
 
   /// 滑块上限与步进（秒）。
+  ///
+  /// 1 秒一档：片头/片尾长度是逐个作品不同的，5 秒一档经常差那么两三秒。
+  /// 滑块旁边还有 −1s / +1s 的微调按钮（300 档滑到精确值太考验手指）。
   static const int maxSeconds = 300;
-  static const int stepSeconds = 5;
+  static const int stepSeconds = 1;
 
   /// 上游原本只有这几档，保留成快捷按钮；精确秒数用滑块自己拖。
   static const List<int> quickOptions = <int>[0, 10, 15, 20, 30, 60];
@@ -163,6 +166,13 @@ class AudioSkipPointsRows extends StatelessWidget {
                   children: [
                     Text('当前', style: muted),
                     const Spacer(),
+                    IconButton(
+                      key: const Key('audio_skip_minus'),
+                      tooltip: '减 1 秒',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: draft <= 0 ? null : () => commit(draft - 1),
+                      icon: const Icon(LucideIcons.minus, size: 18),
+                    ),
                     Text(
                       draft == 0 ? '不跳过' : '$draft 秒',
                       style: TextStyle(
@@ -170,6 +180,15 @@ class AudioSkipPointsRows extends StatelessWidget {
                         fontWeight: FontWeight.w700,
                         color: palette.accentText,
                       ),
+                    ),
+                    IconButton(
+                      key: const Key('audio_skip_plus'),
+                      tooltip: '加 1 秒',
+                      visualDensity: VisualDensity.compact,
+                      onPressed: draft >= maxSeconds
+                          ? null
+                          : () => commit(draft + 1),
+                      icon: const Icon(LucideIcons.plus, size: 18),
                     ),
                   ],
                 ),

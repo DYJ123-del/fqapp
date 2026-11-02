@@ -8,11 +8,12 @@ import 'package:fqapp/widgets/audio/audio_skip_points_rows.dart';
 /// 上游原有的 0/10/15/20/30 只是快捷按钮，滑块 5 秒一档拖到 0~300 任意值。
 void main() {
   group('AudioSkipPointsRows.snap', () {
-    test('对齐到 5 秒一档', () {
+    test('1 秒一档：任意整秒都保留（不再被 5 秒取整）', () {
+      expect(AudioSkipPointsRows.stepSeconds, 1);
       expect(AudioSkipPointsRows.snap(0), 0);
-      expect(AudioSkipPointsRows.snap(13), 15);
-      expect(AudioSkipPointsRows.snap(12), 10);
-      expect(AudioSkipPointsRows.snap(147), 145);
+      expect(AudioSkipPointsRows.snap(13), 13);
+      expect(AudioSkipPointsRows.snap(12), 12);
+      expect(AudioSkipPointsRows.snap(147), 147);
     });
 
     test('夹在 0~300 之间', () {
@@ -73,6 +74,25 @@ void main() {
     expect(last.introSeconds, lessThan(200));
     expect(last.introSeconds % AudioSkipPointsRows.stepSeconds, 0);
     expect(last.outroSeconds, 40);
+  });
+
+  testWidgets('±1 秒微调：加一次就是 +1，减一次就是 -1', (tester) async {
+    final emitted = <AudioSkipPoints>[];
+    await tester.pumpWidget(mount(
+      const AudioSkipPoints(introSeconds: 24, outroSeconds: 0),
+      emitted.add,
+    ));
+
+    await tester.tap(find.byKey(const Key('audio_skip_intro')));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const Key('audio_skip_plus')));
+    await tester.pumpAndSettle();
+    expect(emitted.last.introSeconds, 25);
+
+    await tester.tap(find.byKey(const Key('audio_skip_minus')));
+    await tester.pumpAndSettle();
+    expect(emitted.last.introSeconds, 24);
   });
 
   testWidgets('快捷档位仍可选，且只改自己那一项', (tester) async {
