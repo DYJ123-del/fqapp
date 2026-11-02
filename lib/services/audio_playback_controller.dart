@@ -244,10 +244,15 @@ class _AudioPlaybackController extends ChangeNotifier
   Future<void> _startFirstChapter() async {
     await _settingsReady;
     if (_closed || _chapters.isEmpty) return;
-    // 绝不等待 /tones 再起播：p09 回归测试要求「慢响应不能延迟首播」
-    // （test/review_fix_b12_test.dart 的两条用例）。首播一律用默认音色 `0`，
-    // 偏好音色在后台补齐后由 _lateAdoptPreferredTone 切换。
-    unawaited(_autoAdoptPreferredTone());
+    // 报名了「默认按偏好选音色」的入口（详情页 / 阅读页 / 胶囊点听书）：
+    // **先定音色，再起播** —— 用户要的是 1.0.133 的行为，不要「先按默认
+    // TTS 播几秒再切」。只有 adoptPreferredTone 为真才会等 /tones，而上游
+    // p09 回归（慢响应不得延迟首播，用例全是默认 false 的 AudioPage）以及
+    // audio_real_alignment 的 21 个布局用例都因此不受影响。
+    if (request.adoptPreferredTone) {
+      await _adoptPreferredToneBeforeStart();
+      if (_closed || _chapters.isEmpty) return;
+    }
     await _openChapter(
       _index,
       restoreHistory: true,
@@ -258,25 +263,36 @@ class _AudioPlaybackController extends ChangeNotifier
     );
   }
 
-  /// 没有任何历史音色时，按用户偏好定默认音色：
-  /// 真人讲书（作品自带音频）→ 多角色 → 保持默认音色 `0`。
+  /// 起播前的音色决策：有界等待 /tones（详情页预热过就是内存命中，不耗时）。
+  ///
+  /// 2.5 秒还拿不到就按默认音色起播，并交给 [_lateAdoptPreferredTone] 在后台
+  /// 补选 —— 有界等待是硬约束：装饰接口挂住不能把听书卡死。
   ///
   /// `_toneId != '0'` 说明 [_prepareSettings] 已经用过历史或外部指定的音色，
   /// 这种情况一律不动，尊重用户上次的选择。
-  ///
-  /// **不阻塞**：/tones 还没回来就交给 [_lateAdoptPreferredTone] 在后台等。
-  Future<void> _autoAdoptPreferredTone() async {
-    if (!request.adoptPreferredTone) return;
+  Future<void> _adoptPreferredToneBeforeStart() async {
     if (_closed || _toneId != '0') return;
-    if (_extras.tones.isEmpty) {
+    final future = _extrasFuture ?? _loadExtrasSafely();
+    AudioExtras loaded;
+    try {
+      loaded = await future.timeout(const Duration(milliseconds: 2500));
+    } catch (_) {
+      // 超时：先按默认音色起播，等 /tones 回来再补选。
       unawaited(_lateAdoptPreferredTone());
       return;
     }
-    await _applyPreferredTone(_extras);
+    if (_closed) return;
+    await _applyPreferredTone(loaded);
   }
 
   /// 把偏好音色落地：真人讲书换书版本，多角色换 tone_id。
-  Future<void> _applyPreferredTone(AudioExtras loaded) async {
+  ///
+  /// [reopenChapter] 只在起播之后调用时为真：播放器已经起来了，换音色必须
+  /// 重开本章才生效。起播前调用不用重开——[_startFirstChapter] 自己会开章。
+  Future<void> _applyPreferredTone(
+    AudioExtras loaded, {
+    bool reopenChapter = false,
+  }) async {
     if (_closed || _toneId != '0') return;
     final byId = <String, AudioVoice>{
       for (final voice in _voices) voice.id: voice,
@@ -296,8 +312,7 @@ class _AudioPlaybackController extends ChangeNotifier
       await _adoptNarratorVersion(preferred);
     } else if (_toneId != preferred.id) {
       _update(() => _toneId = preferred.id);
-      // 播放器已经起来了，换音色要重开本章才能生效。
-      if (_chapters.isNotEmpty) {
+      if (reopenChapter && _chapters.isNotEmpty) {
         unawaited(
           _openChapter(_index, toneId: preferred.id, autoplay: _wantPlay),
         );
@@ -324,7 +339,7 @@ class _AudioPlaybackController extends ChangeNotifier
     if (_closed || _toneId != '0' || _toneUserSelected) return;
     // 已经听了一段就不再打断，避免中途换书跳到别处。
     if (_position.value > const Duration(seconds: 20)) return;
-    await _applyPreferredTone(loaded);
+    await _applyPreferredTone(loaded, reopenChapter: true);
   }
 
   /// 把播放上下文切到真人讲书版本。

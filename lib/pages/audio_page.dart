@@ -18,6 +18,7 @@ import '../services/audio_download_store.dart';
 import '../services/audio_history.dart';
 import '../services/audio_floating_routes.dart';
 import '../services/audio_page_theme.dart';
+import '../services/async_value_cache.dart';
 import '../services/audio_play_error.dart';
 import '../services/audio_playback_choice.dart';
 import '../services/audio_subtitle_synth.dart';
@@ -230,7 +231,22 @@ typedef _RoutePlayback = ({
   bool autoplay,
 });
 
-Future<AudioExtras> _defaultAudioExtras(String bookId) async {
+/// 听书的装饰信息（音色表 / 相关作品 / 详情）缓存。
+///
+/// 为什么要有它：选真人讲书必须**在起播之前**定下来（用户明确不要「先按默认
+/// 音色播几秒再切」），而 `/tones` 冷启动要 1~2 秒。详情页拿到章节就预热，
+/// 用户点「听书」时是内存命中，起播路径上不用再等接口。
+final _audioExtrasCache = AsyncValueCache<AudioExtras>(
+  ttl: const Duration(minutes: 10),
+  // 音色表为空说明接口挂了：把空壳缓存十分钟，用户就十分钟都选不到真人讲书。
+  isUsable: (extras) => !extras.tones.isEmpty,
+);
+
+Future<AudioExtras> _defaultAudioExtras(String bookId) =>
+    _audioExtrasCache.fetch(bookId, () => _loadAudioExtrasFromApi(bookId));
+
+/// 从上游拉一份装饰信息；各接口单独吞错，缺一块不影响听书起来。
+Future<AudioExtras> _loadAudioExtrasFromApi(String bookId) async {
   final tones = await ApiClient.instance
       .bookTones(bookId)
       .catchError((Object _) => const AudioToneSet());
@@ -241,6 +257,12 @@ Future<AudioExtras> _defaultAudioExtras(String bookId) async {
       .bookDetail(bookId)
       .catchError((Object _) => const BookDetail());
   return AudioExtras(tones: tones, related: related, detail: detail);
+}
+
+/// 详情页拿到章节后预热：用户点「听书」时起播不用等 `/tones`。
+void warmAudioExtras(String bookId) {
+  if (bookId.isEmpty) return;
+  _audioExtrasCache.warm(bookId, () => _loadAudioExtrasFromApi(bookId));
 }
 
 class _AudioPageState extends State<AudioPage> {

@@ -353,6 +353,11 @@ class _DetailPageState extends State<DetailPage> {
     });
     unawaited(_refreshResume());
     unawaited(_maybeAutoOpenReader());
+    // 听书要「一进去就是真人讲书」，那条路必须在起播前就知道音色表：
+    // 这里先预热 /tones，用户点「听书」时是内存命中，起播完全不用等接口。
+    if (!_isVideo && _allChapters.isNotEmpty) {
+      warmAudioExtras(_contentId);
+    }
 
     await _applyExtras(extrasFuture, generation);
     if (!mounted || generation != _loadGeneration) return;
