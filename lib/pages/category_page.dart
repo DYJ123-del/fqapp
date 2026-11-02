@@ -8,6 +8,7 @@ import '../services/user_facing_error.dart';
 import '../widgets/category/category_dim_rail.dart';
 import '../widgets/home/home_design.dart';
 import '../widgets/home/home_feed_states.dart';
+import 'search_page.dart';
 
 /// 官方分类页（`BookCategoryActivity`，7.0.9.32 实测形态）：
 ///
@@ -349,7 +350,13 @@ class _TopBar extends StatelessWidget {
           IconButton(
             key: const Key('category_search'),
             icon: Icon(LucideIcons.search, size: 20, color: palette.ink),
-            onPressed: () {},
+            // 上游这里一直是空实现（1.0.133 起如此，见 issue #238），按旧版
+            // 首页搜索的交互补上：直接进搜索页。
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(builder: (_) => const SearchPage()),
+              );
+            },
           ),
         ],
       ),
@@ -534,25 +541,38 @@ class _CategoryChip extends StatelessWidget {
     final palette = HomePalette.of(context);
     return Padding(
       padding: const EdgeInsets.only(top: 6, bottom: 4),
-      child: Container(
-        key: ValueKey('category_tile_${tile.id}_${tile.name}'),
-        height: 30,
-        decoration: BoxDecoration(
-          color: palette.eink
-              ? Colors.white
-              : (palette.dark ? palette.soft : const Color(0xFFECECEC)),
-          borderRadius: BorderRadius.circular(6),
-          border: palette.eink ? Border.all(color: palette.line) : null,
-        ),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            if (tile.hot) ...[
-              Icon(LucideIcons.flame, size: 16, color: palette.ink),
-              const SizedBox(width: 2),
+      // 上游只画了 chip、没接点击（issue #238）。按旧版行为补上：点标签即按
+      // 该标签名搜索——App 没有“分类书籍列表”接口，搜索是唯一可用的出口。
+      child: InkWell(
+        key: ValueKey('category_tile_tap_${tile.id}_${tile.name}'),
+        borderRadius: BorderRadius.circular(6),
+        onTap: () {
+          Navigator.of(context).push(
+            MaterialPageRoute<void>(
+              builder: (_) => SearchPage(initialQuery: tile.name),
+            ),
+          );
+        },
+        child: Container(
+          key: ValueKey('category_tile_${tile.id}_${tile.name}'),
+          height: 30,
+          decoration: BoxDecoration(
+            color: palette.eink
+                ? Colors.white
+                : (palette.dark ? palette.soft : const Color(0xFFECECEC)),
+            borderRadius: BorderRadius.circular(6),
+            border: palette.eink ? Border.all(color: palette.line) : null,
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              if (tile.hot) ...[
+                Icon(LucideIcons.flame, size: 16, color: palette.ink),
+                const SizedBox(width: 2),
+              ],
+              Text(tile.name, style: TextStyle(fontSize: 14, color: palette.ink)),
             ],
-            Text(tile.name, style: TextStyle(fontSize: 14, color: palette.ink)),
-          ],
+          ),
         ),
       ),
     );

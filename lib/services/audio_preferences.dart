@@ -20,6 +20,9 @@ class AudioPreferences {
   static const _skipIntroPrefix = 'audio_skip_intro_';
   static const _skipOutroPrefix = 'audio_skip_outro_';
 
+  /// 全局上次倍速（见 [lastRate]）。
+  static const _lastRateKey = 'audio_last_rate';
+
   /// 是否允许后台播放与前台保活（默认 true）。
   /// 开启：切到后台或锁屏时继续播放，由 Android 前台保活服务常驻通知栏与提供控制卡片；
   /// 关闭：切到后台或锁屏时自动暂停播放并移除前台通知。
@@ -39,6 +42,13 @@ class AudioPreferences {
   /// 倍速是否已锁定。锁定期间点倍速项只提示、不弹面板。
   bool rateLocked = false;
 
+  /// 全局「上次调整过的倍速」。
+  ///
+  /// 历史记录里的 `rate` 是按书存的：换一本没听过书就会回到 1.0。用户明确
+  /// 要求「默认速度 = 上次调的那个」，所以这里再存一份全局值，起播时作为
+  /// 按书记录之后的兜底（优先级：路由指定 > 按书记录 > 全局上次 > 1.0）。
+  double? lastRate;
+
   /// 睡眠定时是否停在「听完本章」。与分钟档互斥。
   bool sleepAtChapterEnd = false;
 
@@ -57,6 +67,8 @@ class AudioPreferences {
       rateEngine.value = AudioRateEngine.fromName(sp.getString(_rateEngineKey));
       rateLocked = sp.getBool(_rateLockedKey) ?? false;
       sleepAtChapterEnd = sp.getBool(_sleepAtChapterEndKey) ?? false;
+      final last = sp.getDouble(_lastRateKey);
+      if (last != null && last.isFinite) lastRate = last;
     } catch (_) {
       // 异常时退回默认值（后台播放开、系统变速、未锁定、分钟档）
     }
@@ -69,6 +81,7 @@ class AudioPreferences {
     backgroundPlayback.value = true;
     rateEngine.value = AudioRateEngine.builtIn;
     rateLocked = false;
+    lastRate = null;
     sleepAtChapterEnd = false;
     _skipIntro.clear();
     _skipOutro.clear();
@@ -122,6 +135,17 @@ class AudioPreferences {
     try {
       final sp = await SharedPreferences.getInstance();
       await sp.setBool(_rateLockedKey, value);
+    } catch (_) {
+      // 忽略持久化失败
+    }
+  }
+
+  /// 记录全局上次倍速（见 [lastRate]）。
+  Future<void> setLastRate(double value) async {
+    lastRate = value;
+    try {
+      final sp = await SharedPreferences.getInstance();
+      await sp.setDouble(_lastRateKey, value);
     } catch (_) {
       // 忽略持久化失败
     }

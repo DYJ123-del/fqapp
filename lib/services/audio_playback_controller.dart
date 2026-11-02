@@ -68,6 +68,10 @@ class _AudioPlaybackController extends ChangeNotifier
   Duration _duration = Duration.zero;
   List<AudioVoice> _voices = const [_defaultVoice];
   AudioExtras _extras = const AudioExtras();
+
+  /// 本本书设置阶段发起的那次 /tones 请求（[_prepareSettings] 里赋值）。
+  /// 起播时的默认音色决策复用同一个 future，避免重复请求。
+  Future<AudioExtras>? _extrasFuture;
   SubtitleTrack _subtitles = SubtitleTrack.empty;
 
   /// 当前字幕轨是否由本地估算生成（服务端没有文稿时的兜底）。
@@ -224,16 +228,146 @@ class _AudioPlaybackController extends ChangeNotifier
     if (_chapters.isEmpty) {
       _loading = false;
     } else {
-      unawaited(
-        _openChapter(
-          _index,
-          restoreHistory: true,
-          autoplay: request.autoplay,
-          position: request.startPosition,
-          paragraph: request.startParagraph,
-          fraction: request.startFraction,
-        ),
-      );
+      unawaited(_startFirstChapter());
+    }
+  }
+
+  /// 起播入口：先按偏好定音色（必要时切到真人讲书版本），再开第一章。
+  ///
+  /// 必须在 [_openChapter] 之前做完：`_openChapter` 在自己 await `_settingsReady`
+  /// 之前就已经把 `_index` 落库并从 `_chapters[index]` 取摘录了，进去再换书会
+  /// 用到旧章节表。
+  Future<void> _startFirstChapter() async {
+    await _settingsReady;
+    if (_closed || _chapters.isEmpty) return;
+    await _autoAdoptPreferredTone();
+    if (_closed || _chapters.isEmpty) return;
+    await _openChapter(
+      _index,
+      restoreHistory: true,
+      autoplay: request.autoplay,
+      position: request.startPosition,
+      paragraph: request.startParagraph,
+      fraction: request.startFraction,
+    );
+  }
+
+  /// 没有任何历史音色时，按用户偏好定默认音色：
+  /// 真人讲书（作品自带音频）→ 多角色 → 保持默认音色 `0`。
+  ///
+  /// `_toneId != '0'` 说明 [_prepareSettings] 已经用过历史或外部指定的音色，
+  /// 这种情况一律不动，尊重用户上次的选择。
+  Future<void> _autoAdoptPreferredTone() async {
+    if (_closed || _toneId != '0') return;
+    // 复用 _prepareSettings 里已经发起的那次请求，避免重复打 /tones。
+    var loaded = _extras;
+    if (loaded.tones.isEmpty) {
+      try {
+        // 起播前的一次性决策：给 2.5s 让 /tones 回来（首次冷启动通常 300ms~1.5s）。
+        // 仍然是有界等待——拿不到就按默认音色起播，绝不无界拖住听书
+        // （p09 回归测试见 test/review_fix_b12_test.dart）。
+        loaded = await (_extrasFuture ?? _loadExtrasSafely()).timeout(
+          const Duration(milliseconds: 2500),
+        );
+      } catch (_) {
+        // 超时：先按默认音色起播，等 /tones 回来再补选（见 _lateAdoptPreferredTone）。
+        unawaited(_lateAdoptPreferredTone());
+        return;
+      }
+    }
+    if (_closed) return;
+    final byId = <String, AudioVoice>{
+      for (final voice in _voices) voice.id: voice,
+    };
+    _mergeToneVoices(loaded, byId);
+    _update(() {
+      _extras = loaded;
+      _voices = List.unmodifiable(byId.values);
+    });
+    final tones = loaded.tones;
+    // 有声书（genre_type == 1）本身就是一条固定录音，`tone_id=0` 就是作品
+    // 自带音频，不需要再挑。
+    if (tones.hasFixedTone) return;
+    final preferred = tones.preferred;
+    if (preferred == null) return;
+    if (tones.narratorTones.any((tone) => tone.id == preferred.id)) {
+      await _adoptNarratorVersion(preferred);
+    } else {
+      _update(() => _toneId = preferred.id);
+    }
+  }
+
+  /// /tones 超时后的补选：等它回来，若还在起播阶段（没怎么播）就切成真人版。
+  ///
+  /// 只在"用户还没实质开始听"时动手，避免听到一半被换书跳到别处。
+  Future<void> _lateAdoptPreferredTone() async {
+    final future = _extrasFuture;
+    if (future == null) return;
+    AudioExtras loaded;
+    try {
+      loaded = await future.timeout(const Duration(seconds: 10));
+    } catch (_) {
+      return;
+    }
+    // 已经选过音色 / 已经播出一段 / 已换章 —— 都不再插手。
+    if (_closed || _toneId != '0') return;
+    if (_position.value > const Duration(seconds: 20)) return;
+    final tones = loaded.tones;
+    if (tones.isEmpty) return;
+    if (!identical(_extras, loaded)) {
+      final byId = <String, AudioVoice>{
+        for (final voice in _voices) voice.id: voice,
+      };
+      _mergeToneVoices(loaded, byId);
+      _update(() {
+        _extras = loaded;
+        _voices = List.unmodifiable(byId.values);
+      });
+    }
+    if (tones.hasFixedTone) return;
+    final preferred = tones.preferred;
+    if (preferred == null) return;
+    if (tones.narratorTones.any((tone) => tone.id == preferred.id)) {
+      await _adoptNarratorVersion(preferred);
+    } else {
+      // 多角色 TTS：播放器已经起来，换音色要重开本章才能生效。
+      _update(() => _toneId = preferred.id);
+      if (_chapters.isNotEmpty) {
+        unawaited(_openChapter(_index, toneId: preferred.id, autoplay: _wantPlay));
+      }
+    }
+  }
+
+  /// 把播放上下文切到真人讲书版本。
+  ///
+  /// 真人讲书的 `abook_id` 是**另一本书**：playinfo 收到 tone_id=abook_id 会
+  /// 回 NO_THIS_TONE，必须用 `book_id = abook_id` + 该书的章节才能播（同
+  /// `_switchBookVersion`）。此处在起播前调用，播放器还没建，不需要释放；
+  /// 任何一步失败都保持原书按默认音色播。
+  Future<void> _adoptNarratorVersion(AudioTone tone) async {
+    final targetId = tone.id.trim();
+    if (targetId.isEmpty || targetId == _bookId) return;
+    try {
+      final chapters = await (request.directoryLoader ?? _defaultDirectory)(
+        targetId,
+      ).timeout(const Duration(seconds: 5));
+      if (_closed || chapters.isEmpty) return;
+      final start = _chapters.isEmpty ? 0 : _narratorChapterIndex(chapters);
+      _update(() {
+        _bookId = targetId;
+        _chapters = List<Chapter>.unmodifiable(chapters);
+        _index = start.clamp(0, chapters.length - 1);
+        _toneId = '0';
+        _extras = const AudioExtras();
+        _excerpt = '';
+        _position.value = Duration.zero;
+        _duration = Duration.zero;
+      });
+      unawaited(_publishExtras(_loadExtrasSafely()));
+      // 跳过片头/片尾是按书存的，换成本书后要重新读一次。
+      unawaited(AudioPreferences.instance.ensureSkipPoints(targetId));
+    } catch (_) {
+      // 切不过去就以当前书 + 默认音色播，不能因为自动选择让听书起不来。
     }
   }
 
@@ -249,7 +383,7 @@ class _AudioPlaybackController extends ChangeNotifier
         return <AudioVoice>[_defaultVoice];
       }
     }();
-    final extras = _loadExtrasSafely();
+    final extras = _extrasFuture = _loadExtrasSafely();
     final saved = await history;
     final available = await voices;
     if (_closed || generation != _settingsGeneration) return;
@@ -279,6 +413,9 @@ class _AudioPlaybackController extends ChangeNotifier
       if (_closed || generation != _settingsGeneration) return;
       if (resolved != null) _mergeToneVoices(resolved, byId);
     }
+    // 全局上次倍速存在 SharedPreferences 里；load 是幂等的，确保起播时能读到。
+    await AudioPreferences.instance.load();
+    if (_closed || generation != _settingsGeneration) return;
     _update(() {
       if (resolved != null) _extras = resolved;
       _voices = List.unmodifiable(byId.values);
@@ -288,6 +425,12 @@ class _AudioPlaybackController extends ChangeNotifier
         }
         if (initialTone != null && initialTone.isNotEmpty) {
           _toneId = initialTone;
+        }
+        // 倍速优先级：路由显式指定 > 本书历史记录 > 全局上次调整过的那档。
+        // 历史里的 rate 是按书存的，换一本没听过的书原本会回到 1.0。
+        final lastRate = AudioPreferences.instance.lastRate;
+        if (lastRate != null && isSupportedRate(lastRate)) {
+          _rate = lastRate;
         }
         if (savedRate is num && isSupportedRate(savedRate.toDouble())) {
           _rate = savedRate.toDouble();
@@ -1184,6 +1327,9 @@ class _AudioPlaybackController extends ChangeNotifier
   }
 
   Future<void> _setRate(double rate) async {
+    if (!isSupportedRate(rate)) return;
+    // 先记下来：下一本书没有自己的倍速记录时用它起播（见 AudioPreferences.lastRate）。
+    unawaited(AudioPreferences.instance.setLastRate(rate));
     final player = _player;
     if (!_ready || player == null) return;
     final generation = _generation;

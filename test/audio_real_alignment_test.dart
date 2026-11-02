@@ -81,7 +81,12 @@ void main() {
   testWidgets('intelligent reading keeps the large cover, not the book row', (
     tester,
   ) async {
-    await _mount(tester, _RealSession(genreType: 0));
+    // 该用例只验证「智能朗读布局用大封面」。不带真人版本，否则会被
+    // _autoAdoptPreferredTone 判定为有真人讲书而切换到另一本书。
+    await _mount(
+      tester,
+      _RealSession(genreType: 0, narratorTones: const []),
+    );
     expect(find.byType(AudioFlipCover), findsOneWidget);
     expect(find.byType(AudioRealBookRow), findsNothing);
   });
