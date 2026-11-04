@@ -122,6 +122,14 @@ class _AudioPlaybackController extends ChangeNotifier
   int? _advanceRemaining;
   final ValueNotifier<int?> _advanceCountdown = ValueNotifier<int?>(null);
 
+  /// 自动连播的重试状态：正在补播的章号、已重试次数。
+  /// 本地改造，见 `audio_playback_advance.dart`；null = 没有在自动连播。
+  int? _advanceTargetIndex;
+  int _advanceAttempts = 0;
+
+  /// 连播重试的界面读数（第几次重试），null = 没在重试。
+  final ValueNotifier<int?> _advanceRetry = ValueNotifier<int?>(null);
+
   /// 跳过片头/片尾（按书，打开章节时读入）。
   AudioSkipPoints _skipPoints = AudioSkipPoints.none;
 

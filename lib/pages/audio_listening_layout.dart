@@ -222,6 +222,8 @@ extension _AudioListeningLayout on _AudioPageState {
                                   ),
                                   const SizedBox(height: 6),
                                   // 官方 `te`「%s后播放下一集」：章末给一段可取消的窗口。
+                                  // 本地已把倒计时关掉（`kAdvanceCountdownEnabled`），
+                                  // 这块只在退回倒计时模式时出现。
                                   ValueListenableBuilder<int?>(
                                     valueListenable: c.advanceCountdown,
                                     builder: (context, seconds, _) =>
@@ -231,6 +233,17 @@ extension _AudioListeningLayout on _AudioPageState {
                                             seconds: seconds,
                                             onCancel: () =>
                                                 _cancelAdvanceCountdown(c),
+                                          ),
+                                  ),
+                                  // 连播失败自动重试：把「正在重试第 N 次」讲清楚。
+                                  ValueListenableBuilder<int?>(
+                                    valueListenable: c.advanceRetry,
+                                    builder: (context, attempt, _) =>
+                                        attempt == null
+                                        ? const SizedBox.shrink()
+                                        : AudioAdvanceRetryBanner(
+                                            attempt: attempt,
+                                            limit: kAdvanceRetryLimit,
                                           ),
                                   ),
                                   Padding(

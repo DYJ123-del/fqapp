@@ -117,7 +117,9 @@ void _onChapterFinished(
     return;
   }
   if (shouldAdvance && c._index + 1 < c._chapters.length) {
-    _beginAdvanceCountdown(c);
+    // 本地改造：倒计时关掉时这里直接开下一章（失败自动重试），见
+    // `audio_playback_advance.dart`。
+    _requestAdvance(c);
     return;
   }
   unawaited(c._pause(player, generation));

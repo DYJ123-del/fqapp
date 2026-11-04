@@ -40,6 +40,7 @@ import '../services/system_tts.dart';
 import '../widgets/audio/audio_offline_section.dart';
 import '../widgets/audio/audio_floating_player.dart';
 import '../widgets/audio/audio_advance_banner.dart';
+import '../widgets/audio/audio_advance_retry_banner.dart';
 import '../widgets/audio/audio_control_rows.dart';
 import '../widgets/audio/audio_quick_rows.dart';
 import '../widgets/audio/audio_real_expanded.dart';
@@ -59,6 +60,7 @@ import 'reader_page.dart';
 import 'system_tts_settings_page.dart';
 
 part 'audio_listening_layout.dart';
+part '../services/audio_playback_advance.dart';
 part '../services/audio_playback_guard.dart';
 part '../services/audio_playback_controller.dart';
 part '../widgets/audio/audio_playback_scope.dart';

@@ -124,7 +124,7 @@ void main() {
       expect(_currentSubtitle(tester), '第二句同步字幕');
       session.players.first.emitCompleted();
       await _flush(tester);
-      // 官方连播倒计时（`te`「%s后播放下一集」）：播完要先过 3 秒窗口才换章。
+      // 本地改造：播完直接接下一集，没有 3 秒倒计时窗口了。
       await tester.pump(const Duration(seconds: 3));
       await _flush(tester);
       expect(session.players, hasLength(2));
