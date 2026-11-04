@@ -84,7 +84,10 @@ void main() {
     final transport = _FakeRustTransport(healthy: false);
     final backend = createBackend(
       transport: transport,
-      timeout: const Duration(milliseconds: 200),
+      // 1s 而不是 200ms：这条断言的是「截止时间到了就失败」这个机制，不是
+      // 某个具体延迟。200ms 在并行跑测试的机器上常常还没轮到第一次健康检查
+      // 就被判超时（healthChecks 拿到 0），dart-gate 会偶发红。
+      timeout: const Duration(seconds: 1),
     );
 
     await expectLater(
@@ -100,7 +103,8 @@ void main() {
     final transport = _FakeRustTransport(blockInit: true);
     final backend = createBackend(
       transport: transport,
-      timeout: const Duration(milliseconds: 200),
+      // 同上：200ms 太紧，负载高时连第一次 init 都还没记上就被判超时。
+      timeout: const Duration(seconds: 1),
     );
 
     // rustTransport.start() itself has no deadline of its own: a native init
