@@ -211,6 +211,19 @@ extension _AudioListeningLayout on _AudioPageState {
                         ),
                 ),
               ),
+              // 连播失败自动重试：和倒计时条共用字幕槽底部，不挤动进度条。
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: ValueListenableBuilder<int?>(
+                  valueListenable: c.advanceRetry,
+                  builder: (context, attempt, _) => attempt == null
+                      ? const SizedBox.shrink()
+                      : AudioAdvanceRetryBanner(
+                          attempt: attempt,
+                          limit: kAdvanceRetryLimit,
+                        ),
+                ),
+              ),
             ],
           );
         },

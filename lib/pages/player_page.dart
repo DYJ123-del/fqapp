@@ -30,6 +30,7 @@ import '../services/library_store.dart';
 import '../services/native_player.dart';
 import '../services/playback_issue.dart';
 import '../services/player_history.dart';
+import '../services/shelf_store.dart';
 import '../services/video_catalogue.dart';
 import '../services/player_layout_preferences.dart';
 import '../services/player_load_diagnostics.dart';
@@ -65,6 +66,13 @@ class PlayerPage extends StatefulWidget {
   final ReaderStore? historyStore;
   final SeriesDetail? initialSeriesDetail;
   final PlayerLoadDiagnostics? loadDiagnostics;
+
+  /// 收藏（本地书架）用的卡片。
+  ///
+  /// 入口手里有完整 [MediaItem] 时传进来最好——收藏记录的 key 取 `seriesId`，
+  /// 集数/分类/封面这些字段也随卡片带进书架；不传就退回用播放页自己的
+  /// `bookId/title/cover/kind` 拼一条最小记录。
+  final MediaItem? shelfItem;
 
   /// 底部 band 装饰数据的可注入 loader（默认走 ApiClient，best-effort：
   /// 失败就缺省，不打扰播放）。测试注入用。
@@ -112,6 +120,7 @@ class PlayerPage extends StatefulWidget {
     this.playerFactory,
     this.historyStore,
     this.loadDiagnostics,
+    this.shelfItem,
     this.seriesLoader,
     this.initialSeriesDetail,
     this.danmakuFetcher,
@@ -264,6 +273,8 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       _seekHintTimer = Timer(const Duration(seconds: 5), _consumeSeekHint);
     }
     _diagnostics = widget.loadDiagnostics ?? PlayerLoadDiagnostics();
+    // 收藏状态跟着本地书架走：详情页/书架页改了，这一颗要立刻跟着变。
+    ShelfStore.instance.listenable.addListener(_onShelfChanged);
     _sources = EpisodeSourceCache(
       loader: (episode) async => EpisodeSource.fromResponse(
         await (widget.contentLoader?.call(episode) ??
@@ -340,6 +351,40 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
 
   /// 进度心跳（1 秒节流）。
   Timer? _danmakuProgressTimer;
+
+  /// 收藏（本地书架）的目标记录：入口传了卡片就用它，否则按播放页字段拼一条。
+  ///
+  /// key 取 `seriesId`（短剧从某一集进来也要落到同一部剧），与详情页
+  /// 「加入书架」、短剧页「收藏」频道用的是同一份 [ShelfStore]。
+  MediaItem get _shelfTarget =>
+      widget.shelfItem ??
+      MediaItem(
+        id: widget.bookId,
+        title: widget.title,
+        cover: widget.cover,
+        author: '',
+        badge: '',
+        ep: widget.eps.length > 1 ? '全${widget.eps.length}集' : '',
+        kind: widget.kind,
+        seriesId: widget.bookId,
+      );
+
+  bool get _favorited => ShelfStore.instance.containsItem(_shelfTarget);
+
+  /// 一次点击切换收藏：命中即移出，未命中即加入，落在播放页自己的提示条上。
+  Future<void> _toggleFavorite() async {
+    if (!ShelfStore.instance.isReady) {
+      PlayerToast.show(context, '本地收藏暂不可用，请重试');
+      return;
+    }
+    final added = await ShelfStore.instance.toggle(_shelfTarget);
+    if (!mounted) return;
+    PlayerToast.show(context, added ? '已加入收藏' : '已取消收藏');
+  }
+
+  void _onShelfChanged() {
+    if (mounted) setState(() {});
+  }
 
   /// 底部 band 装饰，一个 `seriesDetail` 请求全出：完结状态
   /// （`series_status`：官方 `SeriesStatus` 1=已完结/0=更新中/3=今日更新/
@@ -813,6 +858,7 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    ShelfStore.instance.listenable.removeListener(_onShelfChanged);
     _unregisterFairMemoryFlush?.call();
     _unregisterFairMemoryFlush = null;
     unawaited(NativePlayer.setKeepScreenOn(false).catchError((Object _) {}));
@@ -1776,6 +1822,12 @@ class _PlayerPageState extends State<PlayerPage> with WidgetsBindingObserver {
       onError: (error) => _fail(error, _loadGeneration),
       commentCount: _commentCount,
       onComments: widget.shortSeries ? _openComments : null,
+      // 收藏走设备本地书架（短剧页「收藏」频道读同一份记录）。非短剧播放页
+      // 不挂这一颗，避免给电影/电视剧页塞进短剧右栏的行为。
+      favorited: _favorited,
+      onToggleFavorite: widget.shortSeries
+          ? () => unawaited(_toggleFavorite())
+          : null,
       hotComments: _hotComments,
       onHotCommentTap: widget.shortSeries ? _openHotComment : null,
       seriesTitle: _seriesTitle,

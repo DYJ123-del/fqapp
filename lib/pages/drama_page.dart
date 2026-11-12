@@ -406,6 +406,21 @@ class _DramaPageState extends ConsumerState<DramaPage>
   /// 是否已经尝试过服务端频道表（避免重复请求）。
   bool _channelsRequested = false;
 
+  /// 瀑布格频道（看剧 / 漫剧）自动补页的剩余次数。
+  ///
+  /// 上游首屏只回一页（实测 6 条，刚够一屏多），要用户滑到底才 `loadMore`；
+  /// 6 条往往撑不满滚动，触底通知就永远不发，于是「进去只有 6 部，得等一会
+  /// 儿往下滑才出更多」。[_scheduleGridAutofill] 在首屏落定后自己把后面几页
+  /// 补进来，切频道 / 刷新时归零。
+  int _autoFillTries = 0;
+
+  /// 自动补页的目标条数与上限次数。
+  ///
+  /// 两列瀑布一屏约 5 条，18 条 ≈ 三屏半（用户往下滑随时还有内容）；上限 2
+  /// 次是「一页 6 条」时刚好 6 → 12 → 18，不向上去游多打请求。
+  static const int _gridAutoFillFloor = 18;
+  static const int _gridAutoFillMaxTries = 2;
+
   /// Index of the page the viewer is on, the only card that may mount a
   /// texture.
   int _screenIndex = 0;
@@ -792,6 +807,33 @@ class _DramaPageState extends ConsumerState<DramaPage>
       .where((item) => item.kind == _current.kind)
       .toList(growable: false);
 
+  /// 瀑布格频道首屏自动补页（看剧 / 漫剧）。
+  ///
+  /// 上游首屏只回一页，而这一页撑不满可滚动的高度时，`_onGridScroll` 的触底
+  /// 通知永远不来——用户看到的就是「进去只有 6 部，过一会儿往下滑才更多」。
+  /// 这里在内容落定后自己补，直到达到 [_gridAutoFillFloor] 或用完
+  /// [_gridAutoFillMaxTries] 次（每次补完一次 `build` 会再进来一次，靠
+  /// [provider] 的 isLoadMore 门串行）。
+  ///
+  /// 只在「视频流频道」之外、且是 feed 频道时生效：最近 / 收藏是本地列表，
+  /// 没有下一页可补。
+  void _scheduleGridAutofill(List<MediaItem> items, HomeState state) {
+    if (_current.playsInline || !_current.isFeed) return;
+    if (items.length >= _gridAutoFillFloor) {
+      _autoFillTries = 0;
+      return;
+    }
+    if (items.isEmpty) return; // 首屏还在路上
+    if (_autoFillTries >= _gridAutoFillMaxTries) return;
+    if (state.isLoading || state.isLoadMore) return;
+    if (state.error != null || !state.hasMore) return;
+    _autoFillTries++;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      unawaited(ref.read(dramaProvider.notifier).loadMore());
+    });
+  }
+
   /// The feed reacts to its own builds: items arrive asynchronously, and a
   /// channel switch, a refresh or a returning route can all change what the
   /// on-screen card is.
@@ -851,6 +893,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
     setState(() {
       _channel = index;
       _screenIndex = 0;
+      // 新频道重新给足自动补页次数。
+      _autoFillTries = 0;
     });
     // 记住这次选择（官方把 `tab_type` 写回 SP）：下次冷启动直接落在这里。
     final type = channel.serverType;
@@ -917,8 +961,11 @@ class _DramaPageState extends ConsumerState<DramaPage>
     return false;
   }
 
-  Future<void> _refresh() =>
-      ref.read(dramaProvider.notifier).load(manualRefresh: true);
+  Future<void> _refresh() {
+    // 刷新等于重新数一遍：自动补页次数回到满格。
+    _autoFillTries = 0;
+    return ref.read(dramaProvider.notifier).load(manualRefresh: true);
+  }
 
   /// 官方单击语义：**暂停 / 继续当前这条视频**，不跳任何界面。
   ///
@@ -1450,6 +1497,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
     final items = _visibleItems(state);
     // 横滑时要给邻页画预览，先把本频道这一帧的形状与内容记下来。
     _rememberChannel(_channel, channel, items);
+    // 看剧/漫剧首屏不足三屏半就自己补页，别让用户「滑到底才出更多」。
+    _scheduleGridAutofill(items, state);
     // 浅色页（看剧/漫剧/最近/收藏）跟随外观色板：深色 / OLED 下不能再用
     // 白底深字，否则整页和主题完全脱节。视频流仍固定黑底。
     final palette = HomePalette.of(context);
@@ -2175,6 +2224,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
             shortSeries: true,
             openFullScreen: openFullScreen,
             aiGenerated: item.aiGenerated,
+            // 收藏（本地书架）带整张卡片：seriesId 做 key，集数/分类一起进记录。
+            shelfItem: item,
           ),
         ),
       );

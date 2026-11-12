@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:fqapp/models/chapter_media.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/audio_page.dart';
+import 'package:fqapp/services/audio_playback_choice.dart';
 import 'package:fqapp/services/audio_preferences.dart';
 import 'package:fqapp/services/desktop_platform.dart';
 import 'package:fqapp/services/listening_session.dart';
@@ -15,6 +16,11 @@ import 'package:fqapp/services/platform_channel.dart';
 import 'package:fqapp/widgets/audio/audio_control_rows.dart';
 
 import 'support/controlled_player.dart';
+
+/// 本 fork 关闭了章末倒计时（`kAdvanceCountdownEnabled = false`）：章末直接
+/// 连播，没有「可取消的倒计时窗口」。上游这三组用例测的就是那个窗口，关闭
+/// 状态下跳过；将来若把倒计时打开，它们会自动回归。
+bool get _noCountdownSkip => !kAdvanceCountdownEnabled;
 
 void main() {
   setUp(() {
@@ -106,7 +112,7 @@ void main() {
 
   for (final completed in [false, true]) {
     testWidgets(
-      'native error at chapter end stays visible (completed=$completed)',
+      'native error at chapter end rolls on to the next chapter (completed=$completed)',
       (tester) async {
         final player = _NativeEndingPlayer();
         final requests = <String>[];
@@ -115,18 +121,21 @@ void main() {
         player.emitPosition(const Duration(seconds: 553));
         if (completed) player.endPlayback();
         await _flush(tester);
-        player.errors.add(
-          const NativePlaybackException('Playback failed', errorCode: 2001),
-        );
-        await _flush(tester);
-        expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-        expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
+        // completed=true 时旧播放器已经释放（连播会重建），错误流已 close，
+        // 真实场景也不会在 STATE_ENDED 之后再报错——只有没播完的那支造错误。
+        if (!completed) {
+          player.errors.add(
+            const NativePlaybackException('Playback failed', errorCode: 2001),
+          );
+          await _flush(tester);
+        }
         await tester.pump(const Duration(seconds: 5));
         await _flush(tester);
-        expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-        expect(ListeningSession.instance.playing, isFalse);
-        expect(player.disposed, isTrue);
-        expect(requests, ['1']);
+        // 本 fork 的定制：章末几秒内的失败按「本章播完」处理，不弹错误，直接
+        // 续播下一集（见 lib/services/audio_playback_advance.dart）。
+        expect(find.text('播放出错，请稍后重试'), findsNothing);
+        expect(requests, contains('2'));
+        expect(ListeningSession.instance.chapterId, '2');
       },
     );
   }
@@ -162,7 +171,7 @@ void main() {
       expect(ListeningSession.instance.bookId, 'boundary-book');
       expect(ListeningSession.instance.chapterId, '1');
       expect(ListeningSession.instance.playing, action == 'replay');
-    });
+    }, skip: _noCountdownSkip);
   }
 
   for (final action in ['seek', 'back15', 'forward15']) {
@@ -192,7 +201,7 @@ void main() {
       expect(player.disposed, isFalse);
       expect(requests, ['1']);
       expect(ListeningSession.instance.chapterId, '1');
-    });
+    }, skip: _noCountdownSkip);
   }
 
   testWidgets('seek preview cancels chapter advance before release', (
@@ -215,19 +224,21 @@ void main() {
     expect(player.disposed, isFalse);
     expect(requests, ['1']);
     expect(ListeningSession.instance.chapterId, '1');
-  });
+  }, skip: _noCountdownSkip);
 
   for (final background in [false, true]) {
-    testWidgets('chapter countdown respects background playback=$background', (
+    testWidgets('chapter advance respects background playback=$background', (
       tester,
     ) async {
       await AudioPreferences.instance.setBackgroundPlayback(background);
       final player = _NativeEndingPlayer();
       final requests = <String>[];
       await _mount(tester, player: player, sourceRequests: requests);
-      player.endPlayback();
-      await _flush(tester);
+      // 先退到后台再播完：本 fork 没有倒计时窗口，章末立刻连播，所以「后台
+      // 播放关闭时不该继续」必须在连播入口就判掉（上游是在倒计时里取消）。
       tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await _flush(tester);
+      player.endPlayback();
       await _flush(tester);
       await tester.pump(const Duration(seconds: 5));
       await _flush(tester);
@@ -273,20 +284,21 @@ void main() {
     expect(requests, ['1']);
   }, variant: TargetPlatformVariant({TargetPlatform.linux}));
 
-  testWidgets('closing during chapter countdown cancels its timer', (
+  testWidgets('closing right after the chapter advance releases the player', (
     tester,
   ) async {
     final player = _NativeEndingPlayer();
     await _mount(tester, player: player);
     player.endPlayback();
     await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
+    // 本 fork 无倒计时：章末立刻开下一章，界面上不再有 `audio_advance_banner`。
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
     await tester.pumpWidget(const SizedBox.shrink());
     await _flush(tester);
     expect(player.disposed, isTrue);
   });
 
-  testWidgets('next source failure stays on the failed next chapter', (
+  testWidgets('next source failure retries then reports the attempt count', (
     tester,
   ) async {
     final player = _NativeEndingPlayer();
@@ -300,44 +312,56 @@ void main() {
     );
     player.endPlayback();
     await _flush(tester);
-    await tester.pump(const Duration(seconds: 3));
-    await _flush(tester);
     next.completeError(StateError('next chapter source unavailable'));
     await _flush(tester);
-    expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-    expect(player.disposed, isTrue);
-    await tester.pump(const Duration(seconds: 5));
+    // 自动连播失败：丢缓存换地址重试 3 次（间隔 1.5s），用尽才把失败文案
+    // 留在界面上，并带上重试次数（见 lib/services/audio_playback_advance.dart）。
+    await tester.pump(const Duration(seconds: 6));
     await _flush(tester);
-    expect(find.text('播放出错，请稍后重试'), findsOneWidget);
+    expect(find.textContaining('已自动重试'), findsOneWidget);
     expect(ListeningSession.instance.playing, isFalse);
-    expect(requests, ['1', '2']);
+    expect(requests.where((id) => id == '2').length, greaterThan(1));
   });
 
-  for (final choice in ['听完本章', '15 分钟后']) {
-    testWidgets('$choice prevents automatic next at the sleep boundary', (
-      tester,
-    ) async {
-      final player = _NativeEndingPlayer();
-      await _mount(tester, player: player);
-      await tester.tap(find.byKey(const Key('audio_sleep')));
-      await tester.pumpAndSettle();
-      await tester.tap(find.text(choice));
-      await tester.pumpAndSettle();
-      if (choice == '15 分钟后') {
-        await tester.pump(const Duration(minutes: 14, seconds: 59));
-      }
-      player.endPlayback();
-      await _flush(tester);
-      await tester.pump(const Duration(seconds: 5));
-      await _flush(tester);
-      expect(player.disposed, isFalse);
-      expect(player.isPlaying, isFalse);
-      expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
-      expect(ListeningSession.instance.bookId, 'boundary-book');
-      expect(ListeningSession.instance.chapterId, '1');
-      expect(ListeningSession.instance.playing, isFalse);
-    });
-  }
+  testWidgets('听完本章 prevents automatic next at the sleep boundary', (
+    tester,
+  ) async {
+    final player = _NativeEndingPlayer();
+    await _mount(tester, player: player);
+    await tester.tap(find.byKey(const Key('audio_sleep')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('听完本章'));
+    await tester.pumpAndSettle();
+    player.endPlayback();
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 5));
+    await _flush(tester);
+    expect(player.disposed, isFalse);
+    expect(player.isPlaying, isFalse);
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
+    expect(ListeningSession.instance.bookId, 'boundary-book');
+    expect(ListeningSession.instance.chapterId, '1');
+    expect(ListeningSession.instance.playing, isFalse);
+  });
+
+  testWidgets('15 分钟后 stops playback at the deadline', (tester) async {
+    final player = _NativeEndingPlayer();
+    await _mount(tester, player: player);
+    await tester.tap(find.byKey(const Key('audio_sleep')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('15 分钟后'));
+    await tester.pumpAndSettle();
+    await tester.pump(const Duration(minutes: 14, seconds: 59));
+    player.endPlayback();
+    await _flush(tester);
+    await tester.pump(const Duration(seconds: 5));
+    await _flush(tester);
+    // 本 fork 没有倒计时窗口：章末会立刻连播下一集，睡眠定时在 1 秒后到点
+    // 再把它停住。断言的是「到点即停」，不再要求仍停在第一章。
+    expect(ListeningSession.instance.playing, isFalse);
+    expect(player.isPlaying, isFalse);
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
+  });
 }
 
 Future<void> _mount(
