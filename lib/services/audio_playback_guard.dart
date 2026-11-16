@@ -117,7 +117,9 @@ void _onChapterFinished(
     return;
   }
   if (shouldAdvance && c._index + 1 < c._chapters.length) {
-    _beginAdvanceCountdown(c);
+    // 本地改造：倒计时关掉时这里直接开下一章（失败自动重试），见
+    // `audio_playback_advance.dart`。
+    _requestAdvance(c);
     return;
   }
   unawaited(c._pause(player, generation));
@@ -134,6 +136,10 @@ void _handleChapterCompleted(
 ) {
   if (c._closed || c._completed) return;
   final shouldAdvance = c._wantPlay && c._autoAdvance;
+  AppLog.i(
+    'audio',
+    '章末完成：第 ${c._index + 1} 章，连播=${c._autoAdvance}，自动下一集=$shouldAdvance',
+  );
   c._update(() {
     c._completed = true;
     c._wantPlay = false;

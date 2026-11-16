@@ -6,6 +6,22 @@ import 'package:flutter/foundation.dart';
 /// 这里取 3 秒：足够看清并点「取消」，又不会拖慢连续收听。
 const int kAdvanceCountdownSeconds = 3;
 
+/// 章末连播是否走「倒计时窗口」。
+///
+/// 本地改造（1.0.205）：用户要的是本集播完**直接**接下一集，不要那几秒
+/// 倒计时，所以关掉窗口、回调里立刻开下一章。置回 true 就退回到官方式的
+/// 可取消倒计时（[kAdvanceCountdownSeconds] + `AudioAdvanceBanner`），
+/// 两条路都留着，跟版时好对照。
+const bool kAdvanceCountdownEnabled = false;
+
+/// 连播失败后的自动重试：次数（不含第一次尝试）与间隔。
+///
+/// 音频地址是带签名的 CDN 链接（`chapter_media.dart` 的 `_mediaUrl`），
+/// 取流缓存没有 TTL——长章节或长时间暂停后那份地址可能已过期。连播失败
+/// 不再停在错误上等用户手点：丢掉该章缓存换一条新地址重试。
+const int kAdvanceRetryLimit = 3;
+const Duration kAdvanceRetryDelay = Duration(milliseconds: 1500);
+
 /// 睡眠定时档位：关闭 / 听完本章 / N 分钟后，三者互斥。
 ///
 /// 官方 `cip` = 「听完本章」，`doc` = 「剩余本章」，`dod` = 「剩余播放」——

@@ -8,6 +8,7 @@ import 'package:fqapp/models/chapter_media.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/audio_page.dart';
 import 'package:fqapp/services/app_theme.dart';
+import 'package:fqapp/services/audio_playback_choice.dart';
 import 'package:fqapp/services/audio_preferences.dart';
 import 'package:fqapp/services/native_player.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -175,24 +176,19 @@ void main() {
     },
   );
 
-  testWidgets('automatically advances once and stops at the final chapter', (
+  testWidgets('advances straight into the next chapter and stops at the end', (
     tester,
   ) async {
     final session = _Session();
     await _mount(tester, session);
-    // 官方 `te`「%s后播放下一集」：播完先进倒计时窗口，不再立刻跳章。
+    // 本地改造：播完直接接下一集，不再有 3 秒倒计时窗口。
     session.players.first.emitCompleted();
     await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
-    expect(session.players, hasLength(1));
-    await tester.pump(const Duration(seconds: 3));
-    await _flush(tester);
+    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
     expect(session.players, hasLength(2));
     expect(session.store.entry?['chapterId'], '2');
     expect(session.players.last.isPlaying, true);
     session.players.last.emitCompleted();
-    await _flush(tester);
-    await tester.pump(const Duration(seconds: 3));
     await _flush(tester);
     expect(session.players, hasLength(3));
     // 末章播完：不再连播，改为官方 `v7` 的书末提示。
@@ -209,24 +205,60 @@ void main() {
     expect(session.players.last.isPlaying, true);
   });
 
-  testWidgets('cancelling the advance countdown stays on the chapter', (
+  testWidgets('a failed next chapter is retried automatically and then plays', (
     tester,
   ) async {
-    final session = _Session();
+    var failures = 0;
+    final session = _Session(
+      loader: (id, {toneId}) async {
+        // 上一集播完那一刻取流失败（过期签名链接 / 网络抖动）。
+        if (id == '2' && failures++ == 0) {
+          throw StateError('CDN responded HTTP 403');
+        }
+        return _source(id, toneId);
+      },
+    );
     await _mount(tester, session);
     session.players.first.emitCompleted();
     await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsOneWidget);
-
-    await tester.tap(find.byKey(const Key('audio_advance_cancel')));
-    await _flush(tester);
-    expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
-
-    // 取消之后即使等过倒计时窗口，也不能自己跳章。
-    await tester.pump(const Duration(seconds: 5));
-    await _flush(tester);
+    // 失败先亮「正在自动重试」，而不是停在错误上等用户手点。
+    expect(find.byKey(const Key('audio_advance_retry')), findsOneWidget);
     expect(session.players, hasLength(1));
-    expect(find.text('本章已播完'), findsOneWidget);
+
+    await tester.pump(kAdvanceRetryDelay * 2);
+    await _flush(tester);
+    expect(failures, 2);
+    expect(session.players, hasLength(2));
+    expect(session.players.last.isPlaying, true);
+    expect(find.byKey(const Key('audio_advance_retry')), findsNothing);
+    expect(session.store.entry?['chapterId'], '2');
+  });
+
+  testWidgets('automatic retries give up and leave the failure visible', (
+    tester,
+  ) async {
+    var failures = 0;
+    final session = _Session(
+      loader: (id, {toneId}) async {
+        if (id == '2') {
+          failures += 1;
+          throw StateError('CDN responded HTTP 403');
+        }
+        return _source(id, toneId);
+      },
+    );
+    await _mount(tester, session);
+    session.players.first.emitCompleted();
+    await _flush(tester);
+    for (var attempt = 0; attempt <= kAdvanceRetryLimit; attempt++) {
+      await tester.pump(kAdvanceRetryDelay * 2);
+      await _flush(tester);
+    }
+    // 首次 + kAdvanceRetryLimit 次重试，之后不再死循环。
+    expect(failures, kAdvanceRetryLimit + 1);
+    expect(find.byKey(const Key('audio_advance_retry')), findsNothing);
+    expect(find.textContaining('已自动重试'), findsOneWidget);
+    expect(session.players, hasLength(1));
   });
 
   testWidgets(
