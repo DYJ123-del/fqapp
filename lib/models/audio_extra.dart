@@ -101,6 +101,19 @@ class AudioToneSet {
   bool get isEmpty =>
       ttsTones.isEmpty && offlineTones.isEmpty && narratorTones.isEmpty;
 
+  /// 用户偏好：真人讲书（作品自带音频）优先，其次多角色，最后交回默认音色 `0`。
+  ///
+  /// 与 [recommended] 的区别：那个供官方版式参考（多角色优先）且当前没有任何
+  /// 生产调用点；这个才是听书起播时的默认音色策略。
+  AudioTone? get preferred {
+    final narrators = narratorTones.where((tone) => tone.id.trim().isNotEmpty);
+    if (narrators.isNotEmpty) return narrators.first;
+    for (final tone in ttsTones) {
+      if (tone.isMultiTone && tone.id.trim().isNotEmpty) return tone;
+    }
+    return null;
+  }
+
   /// First tone to preselect, preferring a multi-role tone as the official page
   /// does, then the first available voice.
   AudioTone? get recommended {
