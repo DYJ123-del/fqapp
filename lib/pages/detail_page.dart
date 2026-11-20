@@ -504,6 +504,11 @@ class _DetailPageState extends State<DetailPage> {
     unawaited(_loadCachedChapterIds(generation));
     unawaited(_refreshResume());
     unawaited(_maybeAutoOpenReader());
+    // 听书要「一进去就是真人讲书」，那条路必须在起播前就知道音色表：
+    // 这里先预热 /tones，用户点「听书」时是内存命中，起播完全不用等接口。
+    if (!_isVideo && _allChapters.isNotEmpty) {
+      warmAudioExtras(_contentId);
+    }
 
     await _applyExtras(extrasFuture, generation);
     if (!mounted || generation != _loadGeneration) return;
@@ -1559,6 +1564,9 @@ class _DetailPageState extends State<DetailPage> {
           historyStore: widget.readerStore,
           chapters: _allChapters,
           startIndex: index,
+          // 详情页点「听书」和阅读页点「听书」是同一个用户意图：起播后按偏好
+          // 采用真人讲书（→ 多角色），否则这里进来永远是内置 TTS 默认音色。
+          adoptPreferredTone: true,
         ),
       );
     } finally {
@@ -1910,6 +1918,7 @@ class _DetailPageState extends State<DetailPage> {
         // shortSeries 会让长按面板/弹幕/剧评/已看标记/清晰度整组失效
         // （它们都挂在 PlayerPage.shortSeries 门上）。
         shortSeries: true,
+        shelfItem: widget.item,
       ),
       'audio' => AudioPage(
         bookId: _contentId,
@@ -1919,6 +1928,9 @@ class _DetailPageState extends State<DetailPage> {
         chapters: _allChapters,
         startIndex: startIndex,
         resumeSession: false,
+        // 听书详情页点章节（或「开始收听」）也是明确的听书意图，同样按偏好
+        // 采用真人讲书/多角色音色。
+        adoptPreferredTone: true,
       ),
       'manga' => ComicReaderPage(
         bookId: _contentId,

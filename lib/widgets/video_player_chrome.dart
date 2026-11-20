@@ -160,6 +160,12 @@ class VideoPlayerChrome extends StatefulWidget {
   final int commentCount;
   final VoidCallback? onComments;
 
+  /// 本地收藏（书架）状态与切换：官方右栏第一项是「追剧」，本仓库没有账号
+  /// 侧的追剧接口，收藏落到设备本地书架（短剧页的「收藏」频道读的就是它）。
+  /// null 时该项不出现（非短剧播放页）。
+  final bool favorited;
+  final VoidCallback? onToggleFavorite;
+
   /// 热评信息行（官方 `InfoPanelHotCommentView`）：列表来自 `hotOf` 的本地筛选，
   /// 为空时整条不出现。
   final List<PlayletComment> hotComments;
@@ -273,6 +279,8 @@ class VideoPlayerChrome extends StatefulWidget {
     this.landscapeLockEnabled = false,
     this.commentCount = 0,
     this.onComments,
+    this.favorited = false,
+    this.onToggleFavorite,
     this.onSeeked,
     this.hotComments = const [],
     this.onHotCommentTap,
@@ -3898,15 +3906,85 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
     );
   }
 
-  /// 追剧、点赞、分享移除后，右侧只保留已接入的评论入口。
+  /// 追剧、点赞、分享移除后，右侧保留已接入的评论入口；收藏（本地书架）
+  /// 是有意补回来的一颗，压在评论上方（用户要求「评论按钮上方」）。
   Widget _rightBar(EdgeInsets insets) {
-    if (widget.onComments == null) return const SizedBox.shrink();
+    final showFavorite = widget.onToggleFavorite != null;
+    final showComments = widget.onComments != null;
+    if (!showFavorite && !showComments) return const SizedBox.shrink();
     return Positioned(
       right: insets.right + 12,
       bottom: insets.bottom + 172,
-      child: _commentButton(),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (showFavorite) ...[
+            _favoriteButton(),
+            const SizedBox(height: 14),
+          ],
+          if (showComments) _commentButton(),
+        ],
+      ),
     );
   }
+
+  /// 右栏收藏（官方第一项「追剧」的本地等价物）：未收藏是白色实心星，
+  /// 已收藏整体染成番茄金，点一下切换并给出提示。
+  Widget _favoriteButton() => Semantics(
+    button: true,
+    label: widget.favorited ? '取消收藏' : '收藏',
+    child: GestureDetector(
+      key: const ValueKey('player-favorite-button'),
+      onTap: widget.onToggleFavorite,
+      behavior: HitTestBehavior.opaque,
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 46,
+              height: 46,
+              child: widget.favorited
+                  ? ColorFiltered(
+                      colorFilter: const ColorFilter.mode(
+                        Color(0xFFFFCE3D),
+                        BlendMode.srcIn,
+                      ),
+                      child: Image.asset(
+                        'assets/images/drama/rail_follow.webp',
+                        width: 46,
+                        height: 46,
+                        fit: BoxFit.contain,
+                      ),
+                    )
+                  : Image.asset(
+                      'assets/images/drama/rail_follow.webp',
+                      width: 46,
+                      height: 46,
+                      fit: BoxFit.contain,
+                    ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              widget.favorited ? '已收藏' : '收藏',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 12,
+                height: 1.1,
+                fontWeight: FontWeight.bold,
+                color: widget.favorited
+                    ? const Color(0xFFFFCE3D)
+                    : const Color(0xCCFFFFFF),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+
 
   Widget _commentButton() => Semantics(
     button: true,
@@ -3984,6 +4062,10 @@ class _VideoPlayerChromeState extends State<VideoPlayerChrome>
         ),
         if (controls && !_hideFullscreenPill)
           LayoutId(id: _PortraitSlot.fullscreen, child: _fullscreenPill()),
+        // 收藏（本地书架）压在评论钮正上方：官方竖屏目录件里评论在最下沿，
+        // 收藏排在它上面同一列，点一下就能收，不用开面板。
+        if (controls && widget.onToggleFavorite != null)
+          LayoutId(id: _PortraitSlot.favorite, child: _favoriteButton()),
         if (controls && widget.onComments != null)
           LayoutId(id: _PortraitSlot.comments, child: _commentButton()),
       ],
@@ -4932,7 +5014,7 @@ class _LegacyRatePainter extends CustomPainter {
   bool shouldRepaint(_LegacyRatePainter oldDelegate) => false;
 }
 
-enum _PortraitSlot { information, fullscreen, comments }
+enum _PortraitSlot { information, fullscreen, comments, favorite }
 
 class _PortraitControlsLayout extends MultiChildLayoutDelegate {
   _PortraitControlsLayout({required this.insets, required this.videoBottom});
@@ -4961,7 +5043,8 @@ class _PortraitControlsLayout extends MultiChildLayoutDelegate {
     // 两个 slot 各自独立判断，缺一个不能把另一个也丢掉。
     final hasPill = hasChild(_PortraitSlot.fullscreen);
     final hasComments = hasChild(_PortraitSlot.comments);
-    if (!hasPill && !hasComments) return;
+    final hasFavorite = hasChild(_PortraitSlot.favorite);
+    if (!hasPill && !hasComments && !hasFavorite) return;
     final pill = hasPill
         ? layoutChild(
             _PortraitSlot.fullscreen,
@@ -4971,6 +5054,14 @@ class _PortraitControlsLayout extends MultiChildLayoutDelegate {
     final comments = hasComments
         ? layoutChild(
             _PortraitSlot.comments,
+            const BoxConstraints(maxWidth: 64),
+          )
+        : Size.zero;
+    // 收藏钮在评论之上，同一列、同宽约束：位置由评论的落点往上推，
+    // 评论钮本身保持官方位置不动。
+    final favorite = hasFavorite
+        ? layoutChild(
+            _PortraitSlot.favorite,
             const BoxConstraints(maxWidth: 64),
           )
         : Size.zero;
@@ -4987,6 +5078,17 @@ class _PortraitControlsLayout extends MultiChildLayoutDelegate {
       positionChild(
         _PortraitSlot.comments,
         Offset(size.width - insets.right - 4 - comments.width, top - 4),
+      );
+    }
+    if (hasFavorite) {
+      // 顶到安全区上沿就贴住（大字号下收藏钮会长高），否则压住评论钮顶边。
+      final favoriteTop = math.max(
+        minimumTop,
+        top - 4 - favorite.height - 8,
+      );
+      positionChild(
+        _PortraitSlot.favorite,
+        Offset(size.width - insets.right - 4 - favorite.width, favoriteTop),
       );
     }
   }
