@@ -57,6 +57,9 @@ Future<RecentListen?> loadRecentListen() async {
         cover: cover,
         chapters: chapters,
         startIndex: resumeAudioChapterIndex(entry, chapters) ?? 0,
+        // 胶囊「继续收听」也是听书入口：照旧按偏好采用真人讲书/多角色，
+        // 和详情页、阅读页保持一致（用户上次选的音色仍优先）。
+        adoptPreferredTone: true,
       );
     },
   );

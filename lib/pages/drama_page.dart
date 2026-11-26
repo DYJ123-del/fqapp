@@ -929,6 +929,7 @@ class _DramaPageState extends ConsumerState<DramaPage>
       _channel = index;
       _paging = false;
       _channelScrolling = !MediaQuery.disableAnimationsOf(context);
+      _screenIndex = 0;
     });
     _armChannelScrollingWatchdog();
     // 记住这次选择（官方把 `tab_type` 写回 SP）：下次冷启动直接落在这里。
@@ -2382,6 +2383,8 @@ class _DramaPageState extends ConsumerState<DramaPage>
             shortSeries: true,
             openFullScreen: openFullScreen,
             aiGenerated: item.aiGenerated,
+            // 收藏（本地书架）带整张卡片：seriesId 做 key，集数/分类一起进记录。
+            shelfItem: item,
           ),
         ),
       );

@@ -203,6 +203,61 @@ void main() {
     expect(session.players.last.isPlaying, true);
   });
 
+  testWidgets('a failed next chapter is retried automatically and then plays', (
+    tester,
+  ) async {
+    var failures = 0;
+    final session = _Session(
+      loader: (id, {toneId}) async {
+        // 上一集播完那一刻取流失败（过期签名链接 / 网络抖动）。
+        if (id == '2' && failures++ == 0) {
+          throw StateError('CDN responded HTTP 403');
+        }
+        return _source(id, toneId);
+      },
+    );
+    await _mount(tester, session);
+    session.players.first.emitCompleted();
+    await _flush(tester);
+    // 失败先亮「正在自动重试」，而不是停在错误上等用户手点。
+    expect(find.byKey(const Key('audio_advance_retry')), findsOneWidget);
+    expect(session.players, hasLength(1));
+
+    await tester.pump(kAdvanceRetryDelay * 2);
+    await _flush(tester);
+    expect(failures, 2);
+    expect(session.players, hasLength(2));
+    expect(session.players.last.isPlaying, true);
+    expect(find.byKey(const Key('audio_advance_retry')), findsNothing);
+    expect(session.store.entry?['chapterId'], '2');
+  });
+
+  testWidgets('automatic retries give up and leave the failure visible', (
+    tester,
+  ) async {
+    var failures = 0;
+    final session = _Session(
+      loader: (id, {toneId}) async {
+        if (id == '2') {
+          failures += 1;
+          throw StateError('CDN responded HTTP 403');
+        }
+        return _source(id, toneId);
+      },
+    );
+    await _mount(tester, session);
+    session.players.first.emitCompleted();
+    await _flush(tester);
+    for (var attempt = 0; attempt <= kAdvanceRetryLimit; attempt++) {
+      await tester.pump(kAdvanceRetryDelay * 2);
+      await _flush(tester);
+    }
+    // 首次 + kAdvanceRetryLimit 次重试，之后不再死循环。
+    expect(failures, kAdvanceRetryLimit + 1);
+    expect(find.byKey(const Key('audio_advance_retry')), findsNothing);
+    expect(find.textContaining('已自动重试'), findsOneWidget);
+  });
+
   testWidgets(
     'disabling automatic next persists and leaves the completed chapter paused',
     (tester) async {

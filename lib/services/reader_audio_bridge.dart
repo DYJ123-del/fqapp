@@ -186,8 +186,14 @@ abstract final class ReaderAudioBridge {
         tones = session._extras.tones;
       }
 
+      // 与听书页同一个问题：切到某个主播版本后 /tones 只回它自己，面板就
+      // 只剩当前这一版。这里先补齐完整目录，再按目录渲染。
+      await session
+          .ensureNarratorCatalog()
+          .timeout(const Duration(seconds: 2), onTimeout: () {});
+      if (!context.mounted) return VoicePickerOutcome.dismissed;
       final narrators = <VoiceOption>[
-        for (final tone in session._uniqueTones(tones.narratorTones))
+        for (final tone in session._uniqueTones(session._narratorTones))
           VoiceOption(
             id: tone.id,
             title: tone.title,

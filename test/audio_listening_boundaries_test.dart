@@ -101,7 +101,8 @@ void main() {
 
   for (final completed in [false, true]) {
     testWidgets(
-      'native error at chapter end stays visible (completed=$completed)',
+      'native error at chapter end advances instead of stopping '
+      '(completed=$completed)',
       (tester) async {
         final player = _NativeEndingPlayer();
         final requests = <String>[];
@@ -109,18 +110,22 @@ void main() {
         player.emitDuration(const Duration(seconds: 554));
         player.emitPosition(const Duration(seconds: 553));
         if (completed) player.endPlayback();
-        player.errors.add(
-          const NativePlaybackException('Playback failed', errorCode: 2001),
-        );
         await _flush(tester);
-        expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-        expect(find.byKey(const Key('audio_advance_banner')), findsNothing);
+        // completed=true 时旧播放器已经释放，错误流已 close；只有没播完的
+        // 那支才在章末窗口里造错误。
+        if (!completed) {
+          player.errors.add(
+            const NativePlaybackException('Playback failed', errorCode: 2001),
+          );
+          await _flush(tester);
+        }
+        // 本 fork 的定制：章末几秒内的失败按「本章播完」处理，不弹错误，
+        // 直接续播下一集（见 lib/services/audio_playback_advance.dart）。
         await tester.pump(const Duration(seconds: 5));
         await _flush(tester);
-        expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-        expect(ListeningSession.instance.playing, isFalse);
-        expect(player.disposed, isTrue);
-        expect(requests, ['1']);
+        expect(find.text('播放出错，请稍后重试'), findsNothing);
+        expect(requests, contains('2'));
+        expect(ListeningSession.instance.chapterId, '2');
       },
     );
   }
@@ -224,7 +229,7 @@ void main() {
     expect(ListeningSession.instance.playing, isFalse);
   });
 
-  testWidgets('next source failure stays on the failed next chapter', (
+  testWidgets('next source failure is retried then stays visible', (
     tester,
   ) async {
     final player = _NativeEndingPlayer();
@@ -242,13 +247,14 @@ void main() {
     await _flush(tester);
     next.completeError(StateError('next chapter source unavailable'));
     await _flush(tester);
-    expect(find.text('播放出错，请稍后重试'), findsOneWidget);
-    expect(player.disposed, isTrue);
-    await tester.pump(const Duration(seconds: 5));
+    // 本 fork 的定制：开下一章失败先自动重试（3 次），用尽才把错误留在
+    // 界面上，并注明已重试次数。
+    await tester.pump(const Duration(seconds: 8));
     await _flush(tester);
-    expect(find.text('播放出错，请稍后重试'), findsOneWidget);
+    expect(find.textContaining('已自动重试'), findsOneWidget);
+    expect(player.disposed, isTrue);
     expect(ListeningSession.instance.playing, isFalse);
-    expect(requests, ['1', '2']);
+    expect(requests, ['1', '2', '2', '2', '2']);
   });
 
   for (final choice in ['听完本章', '15 分钟后']) {
