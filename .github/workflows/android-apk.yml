@@ -105,6 +105,30 @@ jobs:
       # materialises the historical tags (verified: 0 tags after a depth-1
       # --no-tags clone, 8 after `git fetch --tags`). The full .git is 14 MB,
       # so fetching tags costs seconds.
+      - name: Prefer CN Maven mirrors in every Gradle build
+        # Maven Central 会对 GitHub 共享出口 IP 返回 429，而 429 会被 Gradle
+        # 当成仓库级失败（后续仓库也一起禁用）。Flutter SDK 自带的 included
+        # build（packages/flutter_tools/gradle）只声明 google()/mavenCentral()，
+        # 上层 app 的 pluginManagement 镜像覆盖不到它，所以用 init 脚本给
+        # **所有** settings（含 included build）最前面插一份阿里云镜像。
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/cn-maven-mirrors.gradle" <<'EOF'
+          def mirrors = [
+            'https://maven.aliyun.com/repository/public',
+            'https://maven.aliyun.com/repository/gradle-plugin',
+            'https://maven.aliyun.com/repository/google',
+          ]
+          beforeSettings { settings ->
+            settings.pluginManagement.repositories {
+              mirrors.each { m -> maven { url = m } }
+            }
+            settings.dependencyResolutionManagement.repositories {
+              mirrors.each { m -> maven { url = m } }
+            }
+          }
+          EOF
+
       - name: Fetch version tags for the monotonicity gate
         working-directory: app
         run: |
