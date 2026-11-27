@@ -9,6 +9,8 @@
 /// A3 adds one explicit pilot exception outside the group switch:
 /// `/api/v1/chapters/full` may use the remote source service for a configured
 /// book. It does not move the rest of [SourceGroup.novelContent].
+/// A4-M adds a second, independent pilot exception for
+/// `/api/v1/manga/chapter`; it does not move [SourceGroup.manga].
 ///
 /// Selecting [SourceBackend.remote] for a whole group still makes
 /// [SourceRouter.requireLocal] throw a [StateError] instead of silently
@@ -77,6 +79,7 @@ class SourceRouterConfig {
     this.backends = const {},
     this.remoteBaseUrl,
     this.fullPilotBookIds = const {},
+    this.mangaPilotBookIds = const {},
     this.installToken,
     this.installSigningKey,
   });
@@ -86,23 +89,26 @@ class SourceRouterConfig {
     : backends = const {},
       remoteBaseUrl = null,
       fullPilotBookIds = const {},
+      mangaPilotBookIds = const {},
       installToken = null,
       installSigningKey = null;
 
-  /// Reads the A3 build-only pilot configuration.
+  /// Reads the A3/A4-M build-only pilot configuration.
   ///
   /// No value is read from the network, preferences or the repository. Passing
   /// these defines to a build is what enables the single-path pilot; a normal
   /// build keeps the all-local default.
   factory SourceRouterConfig.fromEnvironment() {
     const rawBaseUrl = String.fromEnvironment('FQ_REMOTE_BASE_URL');
-    const rawBookIds = String.fromEnvironment('FQ_FULL_PILOT_BOOK_IDS');
+    const rawFullBookIds = String.fromEnvironment('FQ_FULL_PILOT_BOOK_IDS');
+    const rawMangaBookIds = String.fromEnvironment('FQ_MANGA_PILOT_BOOK_IDS');
     const token = String.fromEnvironment('FQ_INSTALL_TOKEN');
     const signingKey = String.fromEnvironment('FQ_INSTALL_SIGNING_KEY');
     final baseUrl = rawBaseUrl.trim();
     return SourceRouterConfig(
       remoteBaseUrl: baseUrl.isEmpty ? null : baseUrl,
-      fullPilotBookIds: _parseIds(rawBookIds),
+      fullPilotBookIds: _parseIds(rawFullBookIds),
+      mangaPilotBookIds: _parseIds(rawMangaBookIds),
       installToken: token.isEmpty ? null : token,
       installSigningKey: signingKey.isEmpty ? null : signingKey,
     );
@@ -110,12 +116,15 @@ class SourceRouterConfig {
 
   final Map<SourceGroup, SourceBackend> backends;
 
-  /// Origin of the remote source service. A3 only dereferences it for the
-  /// configured full-chapter pilot books.
+  /// Origin of the remote source service. It is dereferenced only for the
+  /// configured A3/A4-M pilot paths.
   final String? remoteBaseUrl;
 
   /// Exact book ids allowed to use the remote full-chapter pilot.
   final Set<String> fullPilotBookIds;
+
+  /// Exact book ids allowed to use the remote manga-chapter pilot.
+  final Set<String> mangaPilotBookIds;
 
   /// Pre-provisioned A3 test credentials. They are supplied by build defines
   /// and never checked into the repository.
@@ -138,6 +147,7 @@ class SourceRouter {
   SourceRouterConfig get config => _config;
 
   static const String remoteFullPath = '/api/v1/chapters/full';
+  static const String remoteMangaChapterPath = '/api/v1/manga/chapter';
 
   /// Groups that configuration may never move off the local core.
   static const Set<SourceGroup> pinnedLocal = {
@@ -175,6 +185,15 @@ class SourceRouter {
       _config.remoteBaseUrl != null &&
       _config.fullPilotBookIds.contains(bookId);
 
+  /// Whether [bookId] may use the exact A4-M remote manga-chapter path.
+  ///
+  /// This is deliberately narrower than [backendFor]: it never changes the
+  /// backend of the rest of [SourceGroup.manga].
+  bool usesMangaPilot(String bookId) =>
+      bookId.isNotEmpty &&
+      _config.remoteBaseUrl != null &&
+      _config.mangaPilotBookIds.contains(bookId);
+
   /// Resolves the remote full-chapter endpoint for [bookId], or null when the
   /// book is not in the pilot.
   ///
@@ -183,7 +202,22 @@ class SourceRouter {
   /// chapter key material over a non-local cleartext network.
   Uri? fullChapterEndpoint(String bookId) {
     if (!usesFullChapterPilot(bookId)) return null;
-    final base = Uri.tryParse(_config.remoteBaseUrl!);
+    return _validatedRemoteEndpoint(remoteFullPath);
+  }
+
+  /// Resolves the remote manga-chapter endpoint, or null when no remote source
+  /// is configured. Book membership is checked by [usesMangaPilot].
+  Uri? mangaChapterEndpoint() {
+    if (_config.remoteBaseUrl == null) return null;
+    return _validatedRemoteEndpoint(remoteMangaChapterPath);
+  }
+
+  /// Shared validation for the two exact pilot endpoints. The remote service
+  /// must be an origin; only a loopback test service may use plain HTTP.
+  Uri? _validatedRemoteEndpoint(String path) {
+    final rawBaseUrl = _config.remoteBaseUrl;
+    if (rawBaseUrl == null) return null;
+    final base = Uri.tryParse(rawBaseUrl);
     if (base == null ||
         base.host.isEmpty ||
         base.userInfo.isNotEmpty ||
@@ -196,7 +230,7 @@ class SourceRouter {
     if (base.scheme != 'https' && !(base.scheme == 'http' && loopback)) {
       throw StateError('SourceRouter: remote source must use HTTPS');
     }
-    return base.replace(path: remoteFullPath, query: null, fragment: null);
+    return base.replace(path: path, query: null, fragment: null);
   }
 
   static bool _isLoopbackHost(String host) {

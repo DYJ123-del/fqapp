@@ -53,6 +53,10 @@ on:
         description: Comma-separated book IDs allowed to use the remote full-chapter pilot.
         required: false
         default: ''
+      manga_pilot_book_ids:
+        description: Comma-separated book IDs allowed to use the remote manga-chapter pilot.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -453,12 +457,21 @@ jobs:
         env:
           FQ_REMOTE_BASE_URL: ${{ github.event.inputs.remote_source_base_url }}
           FQ_FULL_PILOT_BOOK_IDS: ${{ github.event.inputs.full_pilot_book_ids }}
+          FQ_MANGA_PILOT_BOOK_IDS: ${{ github.event.inputs.manga_pilot_book_ids }}
+          # Pilot credentials are build inputs, not repository contents. Keep
+          # them out of ordinary pull-request artifacts; only a manually
+          # dispatched remote-source build may embed them.
+          FQ_INSTALL_TOKEN: ${{ github.event_name == 'workflow_dispatch' && secrets.FQ_INSTALL_TOKEN || '' }}
+          FQ_INSTALL_SIGNING_KEY: ${{ github.event_name == 'workflow_dispatch' && secrets.FQ_INSTALL_SIGNING_KEY || '' }}
         run: |
           flutter build apk --release \
             --target-platform android-arm,android-arm64 \
             --split-per-abi \
             --dart-define=FQ_REMOTE_BASE_URL="${FQ_REMOTE_BASE_URL:-}" \
-            --dart-define=FQ_FULL_PILOT_BOOK_IDS="${FQ_FULL_PILOT_BOOK_IDS:-}"
+            --dart-define=FQ_FULL_PILOT_BOOK_IDS="${FQ_FULL_PILOT_BOOK_IDS:-}" \
+            --dart-define=FQ_MANGA_PILOT_BOOK_IDS="${FQ_MANGA_PILOT_BOOK_IDS:-}" \
+            --dart-define=FQ_INSTALL_TOKEN="${FQ_INSTALL_TOKEN:-}" \
+            --dart-define=FQ_INSTALL_SIGNING_KEY="${FQ_INSTALL_SIGNING_KEY:-}"
 
       - name: Test Android runtime boundaries
         working-directory: app/android

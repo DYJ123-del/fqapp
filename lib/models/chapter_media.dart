@@ -42,12 +42,17 @@ class ComicImage {
     this.width,
     this.height,
     this.headers = const {},
+    this.encryptKeyHex,
   });
 
   final String url;
   final int? width;
   final int? height;
   final Map<String, String> headers;
+
+  /// Per-chapter AES-256-GCM key for a remote comic image. Null keeps the
+  /// local plaintext-URL behavior unchanged.
+  final String? encryptKeyHex;
 }
 
 const defaultAudioVoices = [AudioVoice(id: '0', label: '默认音色')];

@@ -52,15 +52,14 @@ extension _ComicReaderSession on _ComicReaderPageState {
     try {
       _imageRequest?.cancel();
       final request = _imageRequest = BackendRequest();
-      final images = await ApiClient.instance.withCancellation(
-        request,
-        () async =>
-            await (widget.chapterLoader?.call(chapter) ??
-                ApiClient.instance.comicImages(
-                  chapter.itemId,
-                  bookId: widget.bookId,
-                )),
-      );
+      final images = await _api.withCancellation(request, () async {
+        final loader = widget.chapterLoader;
+        if (loader != null) return loader(chapter);
+        if (_api.usesMangaPilot(widget.bookId)) {
+          return _api.remoteComicImages(widget.bookId, chapter.itemId);
+        }
+        return _api.comicImages(chapter.itemId, bookId: widget.bookId);
+      });
       if (!mounted || generation != _loadGeneration) return;
       if (images.isEmpty) throw const ApiException('本章暂无可阅读图片');
       final saved = await history;

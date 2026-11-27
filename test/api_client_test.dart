@@ -696,6 +696,173 @@ void main() {
     expect(called, isFalse);
   });
 
+  test(
+    'remote manga pilot signs the exact endpoint and keeps page order',
+    () async {
+      final remoteRequests = <http.Request>[];
+      final remote = MockClient((request) async {
+        remoteRequests.add(request);
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        expect(body.keys.toSet(), {'item_id'});
+        expect(request.url.path, '/api/v1/manga/chapter');
+        expect(request.url.query, isEmpty);
+        final timestamp = request.headers['X-FQ-Timestamp']!;
+        final nonce = request.headers['X-FQ-Nonce']!;
+        final bodyHash = sha256.convert(request.bodyBytes).toString();
+        final canonical =
+            'POST\n/api/v1/manga/chapter\n$timestamp\n$nonce\n$bodyHash';
+        final expected = Hmac(
+          sha256,
+          utf8.encode(_testInstallSigningKey),
+        ).convert(utf8.encode(canonical)).toString();
+        expect(request.headers['Authorization'], 'Bearer $_testInstallToken');
+        expect(request.headers['X-FQ-Signature'], 'v1=$expected');
+        return _json(
+          _mangaEnvelope(
+            itemId: 'chapter-1',
+            picUrls: const [
+              'https://cdn.example/a.jpg?sign=a%2Fb&x=1',
+              'https://cdn.example/b.png',
+              'https://cdn.example/a.jpg?sign=a%2Fb&x=1',
+            ],
+          ),
+        );
+      });
+      var localCalls = 0;
+      final local = MockClient((_) async {
+        localCalls++;
+        return _json({});
+      });
+      addTearDown(remote.close);
+      addTearDown(local.close);
+      final api = ApiClient(
+        client: local,
+        remoteClient: remote,
+        sourceRouter: SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18922',
+            mangaPilotBookIds: {'book-1'},
+            installToken: _testInstallToken,
+            installSigningKey: _testInstallSigningKey,
+          ),
+        ),
+      );
+
+      final images = await api.remoteComicImages('book-1', 'chapter-1');
+
+      expect(images.map((image) => image.url), [
+        'https://cdn.example/a.jpg?sign=a%2Fb&x=1',
+        'https://cdn.example/b.png',
+        'https://cdn.example/a.jpg?sign=a%2Fb&x=1',
+      ]);
+      expect(
+        images.every((image) => image.encryptKeyHex == _mangaImageKeyHex),
+        isTrue,
+      );
+      expect(remoteRequests, hasLength(1));
+      expect(localCalls, 0);
+    },
+  );
+
+  test('remote manga failures never call the local comic path', () async {
+    final invalid = <Object>[
+      {
+        'code': 200,
+        'data': _mangaData(picUrls: const ['https://cdn.example/a.jpg']),
+        'relay': {'protocol': 1},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(picUrls: const ['https://cdn.example/a.jpg']),
+        'relay': {'protocol': 2},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(
+          itemId: 'chapter-2',
+          picUrls: const ['https://cdn.example/a.jpg'],
+        ),
+        'relay': {'protocol': 1},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(
+          key: List.filled(63, 'a').join(),
+          picUrls: const ['https://cdn.example/a.jpg'],
+        ),
+        'relay': {'protocol': 1},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(
+          key: List.filled(64, 'z').join(),
+          picUrls: const ['https://cdn.example/a.jpg'],
+        ),
+        'relay': {'protocol': 1},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(picUrls: const []),
+        'relay': {'protocol': 1},
+      },
+      {
+        'code': 0,
+        'data': _mangaData(
+          picUrls: List.generate(65, (_) => 'https://cdn.example/a.jpg'),
+        ),
+        'relay': {'protocol': 1},
+      },
+      for (final url in [
+        '/src/a.jpg',
+        'https://cdn.example/src/a.jpg',
+        'https://user@cdn.example/a.jpg',
+        'file:///tmp/a.jpg',
+        ' https://cdn.example/a.jpg',
+      ])
+        {
+          'code': 0,
+          'data': _mangaData(picUrls: [url]),
+          'relay': {'protocol': 1},
+        },
+      {
+        'code': 0,
+        'data': {'item_id': 'chapter-1', 'encrypt_key': _mangaImageKeyHex},
+        'relay': {'protocol': 1},
+      },
+      http.Response('{}', 502),
+    ];
+
+    for (var index = 0; index < invalid.length; index++) {
+      final payload = invalid[index];
+      final remote = MockClient(
+        (_) async => payload is http.Response ? payload : _json(payload),
+      );
+      var localCalls = 0;
+      final local = MockClient((_) async {
+        localCalls++;
+        return _json({});
+      });
+      addTearDown(remote.close);
+      addTearDown(local.close);
+      final api = ApiClient(
+        client: local,
+        remoteClient: remote,
+        sourceRouter: SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18922',
+            mangaPilotBookIds: {'book-1'},
+          ),
+        ),
+      );
+      await expectLater(
+        api.remoteComicImages('book-1', 'chapter-1'),
+        throwsA(isA<ApiException>()),
+        reason: 'invalid case $index',
+      );
+      expect(localCalls, 0);
+    }
+  });
+
   for (final stallsBody in [false, true]) {
     test(
       'timeout aborts stalled ${stallsBody ? 'body' : 'headers'} only',
@@ -717,6 +884,33 @@ void main() {
     );
   }
 }
+
+const _mangaImageKeyHex =
+    '404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f';
+
+Map<String, dynamic> _mangaData({
+  String itemId = 'chapter-1',
+  String key = _mangaImageKeyHex,
+  required List<String> picUrls,
+}) => {
+  'item_id': itemId,
+  'encrypt_key': key,
+  'pic_infos': [
+    for (final url in picUrls) {'pic_url': url},
+  ],
+};
+
+Map<String, dynamic> _mangaEnvelope({
+  String itemId = 'chapter-1',
+  List<String> picUrls = const ['https://cdn.example/a.jpg'],
+}) => {
+  'code': 0,
+  'data': _mangaData(itemId: itemId, picUrls: picUrls),
+  'relay': {'protocol': 1},
+};
+
+http.Response _json(Object? body, {int status = 200}) =>
+    http.Response.bytes(utf8.encode(jsonEncode(body)), status);
 
 class _AbortAwareClient extends http.BaseClient {
   _AbortAwareClient({required this.stallsBody});
