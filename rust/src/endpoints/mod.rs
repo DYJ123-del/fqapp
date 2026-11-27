@@ -16,6 +16,8 @@ pub mod content;
 pub mod content_util;
 pub mod dhcontent;
 pub mod full;
+#[cfg(feature = "service")]
+pub mod full_relay;
 pub mod home;
 pub mod manga;
 pub mod reader_video;

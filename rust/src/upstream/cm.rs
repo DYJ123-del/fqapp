@@ -57,6 +57,61 @@ pub struct CM {
     iv: [u8; 16],
 }
 
+/// Validates an App-supplied CM public key and wraps it for the upstream
+/// handshake.
+///
+/// The returned value is `base64(iv || AES-128-CBC(pkcs7(public_key)))`, using
+/// the deployment-provided handshake wrapping key. This function never creates
+/// an App private key and never decrypts content.
+pub async fn wrap_client_public_key(
+    client_public_key_b64: &str,
+    handshake_key: &[u8],
+) -> Result<String, String> {
+    if handshake_key.len() != 16 {
+        return Err("handshake key must be 16 bytes".to_string());
+    }
+    let encoded = client_public_key_b64.to_owned();
+    let permit = Arc::clone(&CM_WORK)
+        .acquire_owned()
+        .await
+        .map_err(|e| e.to_string())?;
+    let public_key = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_client_public_key(&encoded)
+    })
+    .await
+    .map_err(|e| format!("client key task failed: {e}"))??;
+
+    let iv: [u8; 16] = rand::thread_rng().gen();
+    let padded = crate::crypto::pkcs7_pad(&public_key, 16);
+    let ciphertext = crate::crypto::aes_cbc_encrypt(&padded, handshake_key, &iv);
+    let mut blob = iv.to_vec();
+    blob.extend_from_slice(&ciphertext);
+    Ok(base64::engine::general_purpose::STANDARD.encode(blob))
+}
+
+fn decode_client_public_key(encoded: &str) -> Result<Vec<u8>, String> {
+    if encoded.is_empty() || !encoded.is_ascii() {
+        return Err("client public key is empty or not ASCII".to_string());
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| "client public key is not standard base64".to_string())?;
+    if base64::engine::general_purpose::STANDARD.encode(&decoded) != encoded {
+        return Err("client public key base64 is not canonical".to_string());
+    }
+    if decoded.is_empty() || decoded.len() > 192 {
+        return Err("client public key must decode to 1-192 bytes".to_string());
+    }
+    if decoded[0] == 0 {
+        return Err("client public key has a sign prefix".to_string());
+    }
+
+    let value = BigUint::from_bytes_be(&decoded);
+    crate::upstream::validate_peer_pubkey(&value, cm_prime(), cm_prime_order())?;
+    Ok(decoded)
+}
+
 impl CM {
     pub async fn new_off_thread() -> Result<Self, String> {
         let permit = Arc::clone(&CM_WORK)

@@ -1,11 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/api_client.dart';
 import 'package:fqapp/services/app_log.dart';
+import 'package:fqapp/services/source_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:pointycastle/api.dart';
+import 'package:pointycastle/block/aes.dart';
+import 'package:pointycastle/block/modes/cbc.dart';
+
+const _testInstallToken = 'fixture';
+const _testInstallSigningKey = 'fixtureSigningKey';
 
 void main() {
   test(
@@ -495,6 +504,198 @@ void main() {
     }
   });
 
+  test(
+    'remote full pilot signs, decrypts locally, and appends the suffix',
+    () async {
+      final remoteRequests = <http.Request>[];
+      final remote = MockClient((request) async {
+        remoteRequests.add(request);
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        final key = request.headers['X-FQ-Signature'];
+        final timestamp = request.headers['X-FQ-Timestamp']!;
+        final nonce = request.headers['X-FQ-Nonce']!;
+        final bodyHash = sha256.convert(request.bodyBytes).toString();
+        final canonical =
+            'POST\n/api/v1/chapters/full\n$timestamp\n$nonce\n$bodyHash';
+        final expected = Hmac(
+          sha256,
+          utf8.encode(_testInstallSigningKey),
+        ).convert(utf8.encode(canonical)).toString();
+        expect(request.headers['Authorization'], 'Bearer $_testInstallToken');
+        expect(key, 'v1=$expected');
+        expect(RegExp(r'^[0-9a-f]{32}$').hasMatch(nonce), isTrue);
+
+        final encrypted = _encryptForClient(
+          body['client_public_key'] as String,
+          '<p>第一段</p><p>第二段</p>',
+        );
+        return http.Response.bytes(
+          utf8.encode(
+            jsonEncode({
+              'code': 0,
+              'data': {
+                'item_infos': {
+                  'chapter-1': {
+                    'title': '第一章',
+                    'key': encrypted.key,
+                    'content': encrypted.content,
+                  },
+                },
+              },
+              'relay': {'protocol': 1, 'content_suffix': '\n\n（完）'},
+            }),
+          ),
+          200,
+        );
+      });
+      final local = MockClient((request) async {
+        fail('local core was called: ${request.url}');
+      });
+      addTearDown(remote.close);
+      addTearDown(local.close);
+      final api = ApiClient(
+        client: local,
+        remoteClient: remote,
+        sourceRouter: SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18921',
+            fullPilotBookIds: {'book-1'},
+            installToken: _testInstallToken,
+            installSigningKey: _testInstallSigningKey,
+          ),
+        ),
+      );
+
+      final content = await api.remoteFullChapterContent('book-1', 'chapter-1');
+
+      expect(content.legacyText, '第一段\n第二段\n（完）');
+      final request = remoteRequests.single;
+      expect(
+        request.url.toString(),
+        'http://127.0.0.1:18921/api/v1/chapters/full',
+      );
+      expect(request.url.query, isEmpty);
+      final sent = jsonDecode(request.body) as Map<String, dynamic>;
+      expect(sent.keys.toSet(), {'book_id', 'item_ids', 'client_public_key'});
+      expect(sent['book_id'], 'book-1');
+      expect(sent['item_ids'], ['chapter-1']);
+    },
+  );
+
+  test('remote full failures never call the local body path', () async {
+    final local = MockClient((request) async {
+      fail('local core was called: ${request.url}');
+    });
+    addTearDown(local.close);
+
+    for (final response in [
+      http.Response(
+        '{"success":false,"error":"upstream failed","error_code":"upstream_error"}',
+        502,
+      ),
+      http.Response(
+        '{"code":0,"data":{"item_infos":{}},"relay":{"protocol":2}}',
+        200,
+      ),
+      http.Response(
+        '{"code":0,"data":{"item_infos":{}},"relay":{"protocol":1}}',
+        200,
+      ),
+    ]) {
+      final remote = MockClient((_) async => response);
+      addTearDown(remote.close);
+      final api = ApiClient(
+        client: local,
+        remoteClient: remote,
+        sourceRouter: SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18921',
+            fullPilotBookIds: {'book-1'},
+          ),
+        ),
+      );
+      await expectLater(
+        api.remoteFullChapterContent('book-1', 'chapter-1'),
+        throwsA(isA<Exception>()),
+      );
+    }
+  });
+
+  test(
+    'remote full rejects a non-zero envelope with valid ciphertext',
+    () async {
+      final local = MockClient((request) async {
+        fail('local core was called: ${request.url}');
+      });
+      final remote = MockClient((request) async {
+        final body = jsonDecode(request.body) as Map<String, dynamic>;
+        final encrypted = _encryptForClient(
+          body['client_public_key'] as String,
+          '<p>不应显示</p>',
+        );
+        return http.Response.bytes(
+          utf8.encode(
+            jsonEncode({
+              'code': 200,
+              'data': {
+                'item_infos': {
+                  'chapter-1': {
+                    'title': '第一章',
+                    'key': encrypted.key,
+                    'content': encrypted.content,
+                  },
+                },
+              },
+              'relay': {'protocol': 1},
+            }),
+          ),
+          200,
+        );
+      });
+      addTearDown(remote.close);
+      addTearDown(local.close);
+      final api = ApiClient(
+        client: local,
+        remoteClient: remote,
+        sourceRouter: SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18921',
+            fullPilotBookIds: {'book-1'},
+          ),
+        ),
+      );
+
+      await expectLater(
+        api.remoteFullChapterContent('book-1', 'chapter-1'),
+        throwsA(isA<ApiException>()),
+      );
+    },
+  );
+
+  test('a non-loopback remote requires install auth before sending', () async {
+    var called = false;
+    final remote = MockClient((_) async {
+      called = true;
+      return http.Response('{}', 200);
+    });
+    addTearDown(remote.close);
+    final api = ApiClient(
+      remoteClient: remote,
+      sourceRouter: SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'https://source.example.invalid',
+          fullPilotBookIds: {'book-1'},
+        ),
+      ),
+    );
+
+    await expectLater(
+      api.remoteFullChapterContent('book-1', 'chapter-1'),
+      throwsA(isA<ApiException>()),
+    );
+    expect(called, isFalse);
+  });
+
   for (final stallsBody in [false, true]) {
     test(
       'timeout aborts stalled ${stallsBody ? 'body' : 'headers'} only',
@@ -546,4 +747,78 @@ class _AbortAwareClient extends http.BaseClient {
     });
     return pending.future;
   }
+}
+
+const _cmPrimeHex =
+    'ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088a67cc74'
+    '020bbea63b139b22514a08798e3404ddef9519b3cd3a431b302b0a6df25f14'
+    '374fe1356d6d51c245e485b576625e7ec6f44c42e9a637ed6b0bff5cb6f406'
+    'b7edee386bfb5a899fa5ae9f24117c4b1fe649286651ece45b3dc2007cb8a1'
+    '63bf0598da48361c55d39a69163fa8fd24cf5f83655d23dca3ad961c62f356'
+    '208552bb9ed529077096966d670c354e4abc9804f1746c08ca237327ffffffff'
+    'ffffffff';
+
+final BigInt _cmPrime = BigInt.parse(_cmPrimeHex, radix: 16);
+
+({String key, String content}) _encryptForClient(
+  String clientPublicKeyBase64,
+  String plaintext,
+) {
+  final clientKey = _bytesToBigInt(base64.decode(clientPublicKeyBase64));
+  final serverPrivate =
+      _bytesToBigInt(List<int>.generate(32, (index) => index + 1)) %
+      (_cmPrime - BigInt.one);
+  final serverPublic = BigInt.two.modPow(serverPrivate, _cmPrime);
+  final serverKeyBytes = _bigIntToBytes(serverPublic);
+  final shared = clientKey.modPow(serverPrivate, _cmPrime);
+  final sharedBytes = _bigIntToBytes(shared);
+  if (sharedBytes.length < 32) {
+    throw StateError('test shared secret is too short');
+  }
+  final aesKey = Uint8List.fromList(sharedBytes.sublist(0, 32));
+  final iv = Uint8List.fromList(List<int>.generate(16, (index) => index));
+  final padded = _padPkcs7(Uint8List.fromList(utf8.encode(plaintext)));
+  final ciphertext = _encryptCbc(padded, aesKey, iv);
+  final blob = Uint8List(iv.length + ciphertext.length)
+    ..setRange(0, iv.length, iv)
+    ..setRange(iv.length, iv.length + ciphertext.length, ciphertext);
+  return (key: base64.encode(serverKeyBytes), content: base64.encode(blob));
+}
+
+BigInt _bytesToBigInt(List<int> bytes) {
+  var value = BigInt.zero;
+  for (final byte in bytes) {
+    value = (value << 8) | BigInt.from(byte);
+  }
+  return value;
+}
+
+Uint8List _bigIntToBytes(BigInt value) {
+  if (value == BigInt.zero) return Uint8List(0);
+  final length = (value.bitLength + 7) >> 3;
+  final bytes = Uint8List(length);
+  var remaining = value;
+  for (var i = length - 1; i >= 0; i--) {
+    bytes[i] = (remaining & BigInt.from(0xff)).toInt();
+    remaining >>= 8;
+  }
+  return bytes;
+}
+
+Uint8List _padPkcs7(Uint8List input) {
+  final paddingLength = 16 - input.length % 16;
+  final padded = Uint8List(input.length + paddingLength);
+  padded.setRange(0, input.length, input);
+  padded.fillRange(input.length, padded.length, paddingLength);
+  return padded;
+}
+
+Uint8List _encryptCbc(Uint8List plaintext, Uint8List key, Uint8List iv) {
+  final cipher = CBCBlockCipher(AESEngine())
+    ..init(true, ParametersWithIV(KeyParameter(key), iv));
+  final ciphertext = Uint8List(plaintext.length);
+  for (var offset = 0; offset < plaintext.length; offset += 16) {
+    cipher.processBlock(plaintext, offset, ciphertext, offset);
+  }
+  return ciphertext;
 }

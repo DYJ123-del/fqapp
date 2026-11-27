@@ -44,6 +44,15 @@ on:
     # unrelated PRs from running the full build.
     paths: *app_paths
   workflow_dispatch:
+    inputs:
+      remote_source_base_url:
+        description: Optional HTTP(S) base URL for the A3 full-chapter pilot.
+        required: false
+        default: ''
+      full_pilot_book_ids:
+        description: Comma-separated book IDs allowed to use the remote full-chapter pilot.
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -441,7 +450,15 @@ jobs:
         # app-armeabi-v7a-release.apk) instead of a fat APK, so a 32-bit
         # device does not download the ARM64 native libraries and vice versa.
         # Keep pub enabled to regenerate the release plugin registrant after tests.
-        run: flutter build apk --release --target-platform android-arm,android-arm64 --split-per-abi
+        env:
+          FQ_REMOTE_BASE_URL: ${{ github.event.inputs.remote_source_base_url }}
+          FQ_FULL_PILOT_BOOK_IDS: ${{ github.event.inputs.full_pilot_book_ids }}
+        run: |
+          flutter build apk --release \
+            --target-platform android-arm,android-arm64 \
+            --split-per-abi \
+            --dart-define=FQ_REMOTE_BASE_URL="${FQ_REMOTE_BASE_URL:-}" \
+            --dart-define=FQ_FULL_PILOT_BOOK_IDS="${FQ_FULL_PILOT_BOOK_IDS:-}"
 
       - name: Test Android runtime boundaries
         working-directory: app/android
