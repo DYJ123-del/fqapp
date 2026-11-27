@@ -1,15 +1,18 @@
-/// Source routing layer (architecture separation, step A1).
+/// Source routing layer (architecture separation, steps A1 and A3).
 ///
 /// Every content request the app makes converges on `ApiClient._get`, which
 /// asks this router where the request should go before dispatching it. The
 /// router classifies the request path into a [SourceGroup] and resolves the
 /// group to a [SourceBackend] through an injectable [SourceRouterConfig].
 ///
-/// A1 ships with every group on the local in-process core, so routing never
-/// changes behavior today. The remote executor does not exist yet: selecting
-/// [SourceBackend.remote] for a group makes [SourceRouter.requireLocal] throw
-/// a [StateError] instead of silently falling back, so a configuration that
-/// arrives before the executor lands fails loudly rather than pretending.
+/// The shipping default remains every group on the local in-process core.
+/// A3 adds one explicit pilot exception outside the group switch:
+/// `/api/v1/chapters/full` may use the remote source service for a configured
+/// book. It does not move the rest of [SourceGroup.novelContent].
+///
+/// Selecting [SourceBackend.remote] for a whole group still makes
+/// [SourceRouter.requireLocal] throw a [StateError] instead of silently
+/// falling back, because the general remote executor is not implemented.
 ///
 /// Two groups are pinned to local in code, not in configuration: [SourceGroup.account]
 /// carries the user's real account cookie (read-only Fanqie import) and must
@@ -70,32 +73,71 @@ enum SourceGroup {
 /// configuration from the network or from disk; callers (tests, later steps)
 /// construct a config and hand it to [SourceRouter].
 class SourceRouterConfig {
-  const SourceRouterConfig({this._backends = const {}, this.remoteBaseUrl});
+  const SourceRouterConfig({
+    this.backends = const {},
+    this.remoteBaseUrl,
+    this.fullPilotBookIds = const {},
+    this.installToken,
+    this.installSigningKey,
+  });
 
   /// Every group on the local core - the shipping default for A1.
   const SourceRouterConfig.allLocal()
-    : _backends = const {},
-      remoteBaseUrl = null;
+    : backends = const {},
+      remoteBaseUrl = null,
+      fullPilotBookIds = const {},
+      installToken = null,
+      installSigningKey = null;
 
-  final Map<SourceGroup, SourceBackend> _backends;
+  /// Reads the A3 build-only pilot configuration.
+  ///
+  /// No value is read from the network, preferences or the repository. Passing
+  /// these defines to a build is what enables the single-path pilot; a normal
+  /// build keeps the all-local default.
+  factory SourceRouterConfig.fromEnvironment() {
+    const rawBaseUrl = String.fromEnvironment('FQ_REMOTE_BASE_URL');
+    const rawBookIds = String.fromEnvironment('FQ_FULL_PILOT_BOOK_IDS');
+    const token = String.fromEnvironment('FQ_INSTALL_TOKEN');
+    const signingKey = String.fromEnvironment('FQ_INSTALL_SIGNING_KEY');
+    final baseUrl = rawBaseUrl.trim();
+    return SourceRouterConfig(
+      remoteBaseUrl: baseUrl.isEmpty ? null : baseUrl,
+      fullPilotBookIds: _parseIds(rawBookIds),
+      installToken: token.isEmpty ? null : token,
+      installSigningKey: signingKey.isEmpty ? null : signingKey,
+    );
+  }
 
-  /// Base URL of the remote source service. Placeholder in A1: stored so the
-  /// configuration shape is stable, never dereferenced.
+  final Map<SourceGroup, SourceBackend> backends;
+
+  /// Origin of the remote source service. A3 only dereferences it for the
+  /// configured full-chapter pilot books.
   final String? remoteBaseUrl;
+
+  /// Exact book ids allowed to use the remote full-chapter pilot.
+  final Set<String> fullPilotBookIds;
+
+  /// Pre-provisioned A3 test credentials. They are supplied by build defines
+  /// and never checked into the repository.
+  final String? installToken;
+  final String? installSigningKey;
 
   /// The configured backend for [group], before the router's pinned-local
   /// overrides. Unlisted groups default to [SourceBackend.local].
   SourceBackend configuredBackendFor(SourceGroup group) =>
-      _backends[group] ?? SourceBackend.local;
+      backends[group] ?? SourceBackend.local;
 }
 
 /// Classifies request paths and resolves them to a backend.
 class SourceRouter {
-  SourceRouter({this._config = const SourceRouterConfig.allLocal()});
+  SourceRouter({SourceRouterConfig? config})
+    : _config = config ?? SourceRouterConfig.fromEnvironment();
 
   final SourceRouterConfig _config;
 
   SourceRouterConfig get config => _config;
+
+  static const String remoteFullPath = '/api/v1/chapters/full';
 
   /// Groups that configuration may never move off the local core.
   static const Set<SourceGroup> pinnedLocal = {
@@ -122,6 +164,47 @@ class SourceRouter {
         'backend, which is not implemented yet (A1)',
       );
     }
+  }
+
+  /// Whether [bookId] may use the exact A3 remote full-chapter path.
+  ///
+  /// This is deliberately narrower than [backendFor]: it never changes the
+  /// backend of the rest of [SourceGroup.novelContent].
+  bool usesFullChapterPilot(String bookId) =>
+      bookId.isNotEmpty &&
+      _config.remoteBaseUrl != null &&
+      _config.fullPilotBookIds.contains(bookId);
+
+  /// Resolves the remote full-chapter endpoint for [bookId], or null when the
+  /// book is not in the pilot.
+  ///
+  /// A configured build must use HTTPS. Plain HTTP is accepted only for a
+  /// loopback test service so the A3 controlled test cannot accidentally send
+  /// chapter key material over a non-local cleartext network.
+  Uri? fullChapterEndpoint(String bookId) {
+    if (!usesFullChapterPilot(bookId)) return null;
+    final base = Uri.tryParse(_config.remoteBaseUrl!);
+    if (base == null ||
+        base.host.isEmpty ||
+        base.userInfo.isNotEmpty ||
+        base.hasQuery ||
+        base.hasFragment ||
+        (base.path.isNotEmpty && base.path != '/')) {
+      throw StateError('SourceRouter: invalid remote source base URL');
+    }
+    final loopback = _isLoopbackHost(base.host);
+    if (base.scheme != 'https' && !(base.scheme == 'http' && loopback)) {
+      throw StateError('SourceRouter: remote source must use HTTPS');
+    }
+    return base.replace(path: remoteFullPath, query: null, fragment: null);
+  }
+
+  static bool _isLoopbackHost(String host) {
+    final normalized = host.toLowerCase();
+    if (normalized == 'localhost' || normalized == '::1') return true;
+    final parts = normalized.split('.');
+    if (parts.length != 4 || !parts.every(_isDecimalOctet)) return false;
+    return int.parse(parts.first) == 127;
   }
 
   /// Classifies [url] by its path. Query and host are irrelevant: the same
@@ -203,4 +286,19 @@ class SourceRouter {
     }
     return SourceGroup.novelContent;
   }
+}
+
+Set<String> _parseIds(String raw) => Set.unmodifiable(
+  raw
+      .split(',')
+      .map((value) => value.trim())
+      .where((value) => value.isNotEmpty),
+);
+
+bool _isDecimalOctet(String value) {
+  if (value.isEmpty || value.length > 3) return false;
+  for (final codeUnit in value.codeUnits) {
+    if (codeUnit < 0x30 || codeUnit > 0x39) return false;
+  }
+  return int.parse(value) <= 255;
 }

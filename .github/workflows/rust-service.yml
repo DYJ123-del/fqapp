@@ -45,12 +45,21 @@ jobs:
         run: |
           rustfmt --check --edition 2021 \
             rust/src/service.rs \
+            rust/src/server.rs \
             rust/src/bin/fqapi_server.rs \
+            rust/src/endpoints/full.rs \
+            rust/src/endpoints/full_relay.rs \
+            rust/src/endpoints/mod.rs \
+            rust/src/upstream/cm.rs \
+            rust/src/device/mod.rs \
             rust/tests/service_boundary.rs \
             rust/tests/service_boot.rs
 
       - name: Run service boundary and boot tests
         run: cargo test --manifest-path rust/Cargo.toml --locked --no-default-features --features service --test service_boundary --test service_boot
+
+      - name: Run Relay auth unit tests
+        run: cargo test --manifest-path rust/Cargo.toml --locked --no-default-features --features service --lib full_relay
 
       - name: Build locked release service
         run: cargo build --manifest-path rust/Cargo.toml --locked --release --no-default-features --features service --bin fqapi_server

@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:isolate';
+import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:http/http.dart' as http;
 
 import '../models/audio_extra.dart';
@@ -33,6 +35,7 @@ import 'api_response_decoder.dart';
 import 'backend_service.dart';
 import 'backend_transport.dart';
 import 'chapter_text_formatter.dart';
+import 'full_chapter_crypto.dart';
 import 'request_gate.dart';
 import 'source_router.dart';
 
@@ -64,12 +67,14 @@ enum PlaybackPurpose {
 class ApiClient {
   ApiClient({
     http.Client? client,
+    http.Client? remoteClient,
     BackendTransport? transport,
     String? baseUrl,
     SourceRouter? sourceRouter,
     this._timeout = const Duration(seconds: 20),
     this._comicTimeout = const Duration(seconds: 90),
   }) : _sourceRouter = sourceRouter ?? SourceRouter(),
+       _remoteClient = remoteClient ?? http.Client(),
        _transport =
            transport ??
            (client != null || baseUrl != null
@@ -181,6 +186,10 @@ class ApiClient {
   /// local core, so this never changes behavior yet.
   final SourceRouter _sourceRouter;
 
+  /// The remote source endpoint is a separate HTTPS service, so it cannot go
+  /// through the local FFI transport or its loopback capability.
+  final http.Client _remoteClient;
+
   /// 视频 tab（短剧 feed）的 cell id，按 tab_type 缓存：官方第二段
   /// `bookmall/cell/change` 必须带这个 tab 的 cell，而它只出现在第一段的响应里。
   /// 每个 tab 一个值，几天内都不会变；取不到时按老路径走，所以缓存过期只会
@@ -232,6 +241,12 @@ class ApiClient {
     }
     return resolveBackendResource(_resourceBase, raw);
   }
+
+  /// Whether [bookId] is in the exact A3 full-chapter pilot. The reader uses
+  /// this before touching its caches so a pilot chapter is never satisfied by
+  /// stale local text.
+  bool usesRemoteFullChapter(String bookId) =>
+      _sourceRouter.usesFullChapterPilot(bookId);
 
   /// Decodes and envelope-checks a response body.
   ///
@@ -368,6 +383,70 @@ class ApiClient {
 
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
+
+  Map<String, String> _remoteFullHeaders(Uri target, List<int> body) {
+    final token = _sourceRouter.config.installToken;
+    final signingKey = _sourceRouter.config.installSigningKey;
+    final loopback = _isLoopbackHost(target.host);
+    if (token == null && signingKey == null) {
+      if (loopback) {
+        return const {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json; charset=utf-8',
+        };
+      }
+      throw const ApiException('远程正文服务未配置鉴权');
+    }
+    if (token == null ||
+        token.isEmpty ||
+        signingKey == null ||
+        signingKey.isEmpty) {
+      throw const ApiException('远程正文服务鉴权配置无效');
+    }
+
+    final timestamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000)
+        .toString();
+    final nonce = _randomHex(16);
+    final bodyHash = sha256.convert(body).toString();
+    final canonical = 'POST\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
+    final signature = Hmac(
+      sha256,
+      utf8.encode(signingKey),
+    ).convert(utf8.encode(canonical)).toString();
+    return {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json; charset=utf-8',
+      'Authorization': 'Bearer $token',
+      'X-FQ-Timestamp': timestamp,
+      'X-FQ-Nonce': nonce,
+      'X-FQ-Signature': 'v1=$signature',
+    };
+  }
+
+  static String _randomHex(int bytes) {
+    final random = Random.secure();
+    final output = StringBuffer();
+    for (var i = 0; i < bytes; i++) {
+      output.write(random.nextInt(256).toRadixString(16).padLeft(2, '0'));
+    }
+    return output.toString();
+  }
+
+  static bool _isLoopbackHost(String host) {
+    final normalized = host.toLowerCase();
+    if (normalized == 'localhost' || normalized == '::1') return true;
+    final parts = normalized.split('.');
+    if (parts.length != 4 || !parts.every(_isDecimalOctet)) return false;
+    return int.parse(parts.first) == 127;
+  }
+
+  static bool _isDecimalOctet(String value) {
+    if (value.isEmpty || value.length > 3) return false;
+    for (final codeUnit in value.codeUnits) {
+      if (codeUnit < 0x30 || codeUnit > 0x39) return false;
+    }
+    return int.parse(value) <= 255;
+  }
 
   /// Directory route for [bookId].
   ///
@@ -1530,6 +1609,105 @@ class ApiClient {
       );
       if (text.trim().isEmpty) throw const ApiException('正文为空');
       return ChapterContent.fromPlainText(text);
+    }
+  }
+
+  /// Loads the exact A3 remote full-chapter pilot.
+  ///
+  /// This is intentionally a separate path from [chapterContent]: a remote
+  /// failure, malformed relay response, or local decrypt failure must escape to
+  /// the reader without trying `/novel`, `/content`, `/batch`, `/toutiao`, or a
+  /// cached body.
+  Future<ChapterContent> remoteFullChapterContent(
+    String bookId,
+    String itemId,
+  ) async {
+    final endpoint = _sourceRouter.fullChapterEndpoint(bookId);
+    if (endpoint == null) {
+      throw StateError('Book is not in the remote full pilot');
+    }
+    final validId = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
+    if (!validId.hasMatch(bookId) || !validId.hasMatch(itemId)) {
+      throw const ApiException('章节参数无效');
+    }
+
+    final handshake = FullChapterHandshake.generate();
+    final watch = Stopwatch()..start();
+    const route = 'POST /api/v1/chapters/full';
+    try {
+      final requestBody = Uint8List.fromList(
+        utf8.encode(
+          jsonEncode({
+            'book_id': bookId,
+            'item_ids': [itemId],
+            'client_public_key': handshake.clientPublicKeyBase64,
+          }),
+        ),
+      );
+      final response = await _remoteClient
+          .post(
+            endpoint,
+            headers: _remoteFullHeaders(endpoint, requestBody),
+            body: requestBody,
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      if (payload['code'] != 0) {
+        throw const ApiException('远程正文业务码异常');
+      }
+
+      final relayRaw = payload['relay'];
+      if (relayRaw is! Map || relayRaw['protocol'] != 1) {
+        throw const ApiException('远程正文协议不匹配');
+      }
+      final suffix = relayRaw['content_suffix'];
+      if (suffix != null && suffix is! String) {
+        throw const ApiException('远程正文协议不匹配');
+      }
+
+      final data = payload['data'];
+      final itemInfos = data is Map ? data['item_infos'] : null;
+      final item = itemInfos is Map ? itemInfos[itemId] : null;
+      if (item is! Map) {
+        throw const ApiException('远程正文缺少章节数据');
+      }
+      final key = item['key'];
+      final content = item['content'];
+      if (key is! String ||
+          key.isEmpty ||
+          content is! String ||
+          content.isEmpty) {
+        throw const ApiException('远程正文缺少密钥或密文');
+      }
+
+      final text = await handshake.decryptChapterInBackground(
+        serverKeyBase64: key,
+        contentBase64: content,
+        contentSuffix: suffix is String ? suffix : '',
+      );
+      if (text.isEmpty) {
+        throw const ApiException('正文为空');
+      }
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
+      );
+      return ChapterContent.fromPlainText(text, illustrationsChecked: true);
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
+    } finally {
+      handshake.destroy();
     }
   }
 

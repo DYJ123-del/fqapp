@@ -694,6 +694,21 @@ impl DevicePool {
         self.state.lock().await.devices.len()
     }
 
+    /// Whether the pool can provide a device with the long-term key needed by
+    /// a `DeviceSigned` request. This is a read-only readiness check: it never
+    /// registers or rotates a device.
+    pub async fn has_usable_device(&self) -> bool {
+        if self.is_retired() {
+            return false;
+        }
+        self.state
+            .lock()
+            .await
+            .devices
+            .iter()
+            .any(|device| !device.secret_key.is_empty())
+    }
+
     /// Manually adds `count` devices to the pool.
     pub async fn refill(&self, count: usize) -> Result<(), String> {
         let _maintenance = self.maintenance_lock.lock().await;

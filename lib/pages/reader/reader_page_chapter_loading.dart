@@ -325,6 +325,14 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
 
   Chapter get _chapter => widget.chapters[_index];
 
+  bool _isRemoteFullPilotChapter(Chapter chapter) =>
+      widget.chapterLoader == null &&
+      !widget.localOnly &&
+      widget.chapterCache == null &&
+      !ImportedBookStore.isLocalBookId(widget.bookId) &&
+      !widget.bookId.startsWith('shuqi:') &&
+      ApiClient.instance.usesRemoteFullChapter(widget.bookId);
+
   ChapterCache get _diskCache =>
       widget.chapterCache ?? ChapterCacheStore.instance;
   CachedBook get _cachedBook => CachedBook(
@@ -386,7 +394,9 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       }
       if (!mounted || generation != _loadGeneration) return;
       // Cache updates may arrive while preferences/history are being read.
-      final text = _chapterCache[chapter.itemId] ?? loaded.text;
+      final text = _isRemoteFullPilotChapter(chapter)
+          ? loaded.text
+          : _chapterCache[chapter.itemId] ?? loaded.text;
       final content = ChapterContent.fromCacheText(text);
       if (content.withoutLeadingTitle(chapter.title).isEmpty) {
         throw const ApiException('本章暂无可显示正文，可切换下一章或从目录选择其他章节');
@@ -456,10 +466,13 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
     bool readDiskCache = true,
   }) async {
     final id = chapter.itemId;
-    final cached = _chapterCache.remove(id);
-    if (cached != null) {
-      _chapterCache[id] = cached;
-      return (text: cached, fetched: false);
+    final remoteFullPilot = _isRemoteFullPilotChapter(chapter);
+    if (!remoteFullPilot) {
+      final cached = _chapterCache.remove(id);
+      if (cached != null) {
+        _chapterCache[id] = cached;
+        return (text: cached, fetched: false);
+      }
     }
     final pending = _chapterRequests[id];
     if (pending != null) return pending;
@@ -505,6 +518,9 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
   ) async {
     cancellation.throwIfCancelled();
     if (!mounted) throw StateError('Reader closed');
+    if (_isRemoteFullPilotChapter(chapter)) {
+      return _chapterText(chapter);
+    }
     // Imported books use their private files. A shared reader request already
     // owns its network slot, so neither path should wait for search pacing.
     if (!_usesChapterDiskCache ||
@@ -543,14 +559,21 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
           ImportedBookStore.isLocalBookId(widget.bookId)) {
         throw const ApiException('此来源的章节未缓存，请从书籍详情重新打开');
       }
-      final request = _chapterRequestHandles.start(chapter.itemId);
-      try {
-        content = await ApiClient.instance.withCancellation(
-          request,
-          () => ApiClient.instance.chapterContent(chapter.itemId),
+      if (_isRemoteFullPilotChapter(chapter)) {
+        content = await ApiClient.instance.remoteFullChapterContent(
+          widget.bookId,
+          chapter.itemId,
         );
-      } finally {
-        _chapterRequestHandles.finish(chapter.itemId, request);
+      } else {
+        final request = _chapterRequestHandles.start(chapter.itemId);
+        try {
+          content = await ApiClient.instance.withCancellation(
+            request,
+            () => ApiClient.instance.chapterContent(chapter.itemId),
+          );
+        } finally {
+          _chapterRequestHandles.finish(chapter.itemId, request);
+        }
       }
     } else {
       final text = await loader(chapter);
@@ -568,6 +591,7 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
     if (widget.localOnly || ImportedBookStore.isLocalBookId(widget.bookId)) {
       return;
     }
+    if (_isRemoteFullPilotChapter(chapter)) return;
     final pending = _chapterRefreshes[chapter.itemId];
     if (pending != null) return pending;
     final request = _upgradeChapter(chapter);
@@ -714,10 +738,15 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
     Chapter chapter, {
     bool readDiskCache = true,
   }) async {
+    final remoteFullPilot = _isRemoteFullPilotChapter(chapter);
     final revision = _chapterCacheRevisions[chapter.itemId] ?? 0;
     bool superseded() =>
         revision != (_chapterCacheRevisions[chapter.itemId] ?? 0);
-    String? text = readDiskCache ? await _readChapterDiskCache(chapter) : null;
+    String? text = remoteFullPilot
+        ? null
+        : readDiskCache
+        ? await _readChapterDiskCache(chapter)
+        : null;
     if (superseded()) return _latestChapterText(chapter);
     final fetched = text == null;
     if (fetched) {
@@ -729,7 +758,7 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       }
       if (superseded()) return _latestChapterText(chapter);
       var chapterSuperseded = false;
-      if (mounted && _usesChapterDiskCache) {
+      if (!remoteFullPilot && mounted && _usesChapterDiskCache) {
         try {
           await _ensureCatalog();
           if (superseded()) {
@@ -749,11 +778,16 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
       if (chapterSuperseded) return _latestChapterText(chapter);
     }
     if (superseded()) return _latestChapterText(chapter);
-    if (mounted) _rememberChapter(chapter.itemId, text);
+    if (mounted && !remoteFullPilot) {
+      _rememberChapter(chapter.itemId, text);
+    }
     return (text: text, fetched: fetched);
   }
 
   Future<_LoadedChapter> _latestChapterText(Chapter chapter) async {
+    if (_isRemoteFullPilotChapter(chapter)) {
+      return _loadChapterText(chapter);
+    }
     final cached = _chapterCache[chapter.itemId];
     return cached == null
         ? _loadChapterText(chapter)
@@ -761,6 +795,7 @@ extension _ReaderPageChapterLoading on _ReaderPageState {
   }
 
   Future<void> _prefetchAround(int index) async {
+    if (_isRemoteFullPilotChapter(_chapter)) return;
     final nearby = <Chapter>[
       if (index > 0) widget.chapters[index - 1],
       if (index + 1 < widget.chapters.length) widget.chapters[index + 1],

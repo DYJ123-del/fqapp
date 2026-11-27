@@ -372,7 +372,7 @@ fn body_error_message(status: StatusCode) -> &'static str {
 }
 
 /// Reads a request body into memory, refusing once it exceeds `limit`.
-async fn read_request_body(mut body: Body, limit: usize) -> Result<Vec<u8>, StatusCode> {
+pub(crate) async fn read_request_body(mut body: Body, limit: usize) -> Result<Vec<u8>, StatusCode> {
     use http_body_util::BodyExt;
 
     let mut out = Vec::new();

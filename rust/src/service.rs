@@ -1,8 +1,9 @@
 //! Standalone read-only HTTP service.
 //!
 //! This adapter deliberately has a smaller surface than the app loopback
-//! server: only health plus the narrow book detail/directory and novel-detail
-//! shapes are admitted, and only `GET` reaches the dispatcher.
+//! server: health, the narrow book detail/directory and novel-detail shapes,
+//! and one exact `POST /api/v1/chapters/full` Relay. Only the metadata shapes
+//! reach the dispatcher.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -19,8 +20,10 @@ use serde_json::json;
 use crate::config::Config;
 use crate::device::{pool_crypto, DevicePool};
 use crate::dispatch::{dispatch, Request, ResponseBody};
+use crate::endpoints::full_relay::{self, RelayAuth, RelayHandshakeKey};
 use crate::endpoints::{Ctx, Server};
 use crate::filter::FilterManager;
+use crate::server::read_request_body;
 use crate::sign::Manager;
 use crate::upstream::UpstreamClient;
 
@@ -80,6 +83,43 @@ pub async fn build_server(options: &ServiceOptions) -> Result<Arc<Server>, Strin
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, server: Arc<Server>) -> Result<(), String> {
+    let relay_auth = RelayAuth::from_env()?.map(Arc::new);
+    let relay_handshake_key = RelayHandshakeKey::from_env()?.map(Arc::new);
+    if relay_auth.is_some() && relay_handshake_key.is_none() {
+        return Err(format!(
+            "{} is required when installation authentication is enabled",
+            full_relay::HANDSHAKE_KEY_ENV
+        ));
+    }
+    serve_inner(listener, server, relay_auth, relay_handshake_key).await
+}
+
+/// Host-test entry point with an explicit Relay handshake key.
+///
+/// The production [`serve`] path reads the key from the environment. Tests use
+/// this helper so they never mutate process-wide environment variables.
+pub async fn serve_with_relay_key(
+    listener: tokio::net::TcpListener,
+    server: Arc<Server>,
+    handshake_key: Option<[u8; 16]>,
+) -> Result<(), String> {
+    serve_inner(
+        listener,
+        server,
+        None,
+        handshake_key
+            .map(RelayHandshakeKey::from_bytes)
+            .map(Arc::new),
+    )
+    .await
+}
+
+async fn serve_inner(
+    listener: tokio::net::TcpListener,
+    server: Arc<Server>,
+    relay_auth: Option<Arc<RelayAuth>>,
+    relay_handshake_key: Option<Arc<RelayHandshakeKey>>,
+) -> Result<(), String> {
     let local = listener
         .local_addr()
         .map_err(|error| format!("service listener address: {error}"))?;
@@ -91,6 +131,8 @@ pub async fn serve(listener: tokio::net::TcpListener, server: Arc<Server>) -> Re
     let state = ServiceState {
         server,
         port: local.port(),
+        relay_auth,
+        relay_handshake_key,
     };
     let app = Router::new().fallback(handle_request).with_state(state);
     axum::serve(listener, app)
@@ -102,6 +144,8 @@ pub async fn serve(listener: tokio::net::TcpListener, server: Arc<Server>) -> Re
 struct ServiceState {
     server: Arc<Server>,
     port: u16,
+    relay_auth: Option<Arc<RelayAuth>>,
+    relay_handshake_key: Option<Arc<RelayHandshakeKey>>,
 }
 
 // This build binds loopback only. A public deployment must replace this check
@@ -215,6 +259,18 @@ async fn handle_request(
     let query = incoming.uri().query().unwrap_or("").to_string();
     let is_get = incoming.method() == axum::http::Method::GET;
 
+    if path == full_relay::FULL_RELAY_PATH {
+        if incoming.method() != axum::http::Method::POST {
+            return relay_error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "method not allowed",
+                Some("POST"),
+            );
+        }
+        return handle_full_relay(state, incoming).await;
+    }
+
     let Some(route) = route_for(&path) else {
         return error_response(StatusCode::NOT_FOUND, "not found", false);
     };
@@ -246,6 +302,79 @@ async fn handle_request(
             StatusCode::GATEWAY_TIMEOUT,
             "request deadline exceeded",
             false,
+        ),
+    }
+}
+
+async fn handle_full_relay(state: ServiceState, incoming: axum::extract::Request) -> AxumResponse {
+    let declared = incoming
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > full_relay::FULL_RELAY_BODY_LIMIT as u64) {
+        return relay_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "request body too large",
+            None,
+        );
+    }
+    let headers: Vec<(String, String)> = incoming
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+
+    match crate::upstream::budget::within(
+        crate::upstream::budget::HTTP_REQUEST_TIMEOUT,
+        async move {
+            let body =
+                match read_request_body(incoming.into_body(), full_relay::FULL_RELAY_BODY_LIMIT)
+                    .await
+                {
+                    Ok(body) => body,
+                    Err(status) if status == StatusCode::PAYLOAD_TOO_LARGE => {
+                        return relay_error_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request_too_large",
+                            "request body too large",
+                            None,
+                        );
+                    }
+                    Err(_) => {
+                        return relay_error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "invalid request",
+                            None,
+                        );
+                    }
+                };
+            let response = full_relay::handle(
+                &state.server.ctx,
+                state.relay_auth.as_deref(),
+                state.relay_handshake_key.as_deref(),
+                &headers,
+                &body,
+            )
+            .await;
+            response_from_dispatch(response)
+        },
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(()) => relay_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            "deadline_exceeded",
+            "request deadline exceeded",
+            None,
         ),
     }
 }
@@ -297,6 +426,27 @@ fn error_response(status: StatusCode, message: &'static str, allow_get: bool) ->
     let mut builder = secured_builder(status, JSON_CONTENT_TYPE);
     if allow_get {
         builder = builder.header(header::ALLOW, HeaderValue::from_static("GET"));
+    }
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn relay_error_response(
+    status: StatusCode,
+    error_code: &'static str,
+    message: &'static str,
+    allow: Option<&'static str>,
+) -> AxumResponse {
+    let body = serde_json::to_vec(&json!({
+        "success": false,
+        "error": message,
+        "error_code": error_code,
+    }))
+    .unwrap_or_default();
+    let mut builder = secured_builder(status, JSON_CONTENT_TYPE);
+    if let Some(allow) = allow {
+        builder = builder.header(header::ALLOW, HeaderValue::from_static(allow));
     }
     builder
         .body(Body::from(body))

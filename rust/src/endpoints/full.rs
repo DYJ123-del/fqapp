@@ -38,14 +38,17 @@ pub fn parse_item_ids(raw: &str) -> Vec<String> {
         .collect()
 }
 
-pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiResult<Value> {
-    let cm = Arc::new(
-        CM::new_off_thread()
-            .await
-            .map_err(|e| ApiError::Internal(format!("cm init: {e}")))?,
-    );
-    let key = cm.client_handshake();
-
+/// Sends one `full/mget` request through the device pool and returns the raw
+/// upstream bytes untouched.
+///
+/// This is shared with the Relay path. It performs no content decryption and
+/// does not inspect or rewrite `item_infos`.
+pub(crate) async fn fetch_full_mget_raw(
+    ctx: &Ctx,
+    book_id: &str,
+    item_ids: &[String],
+    key: &str,
+) -> ApiResult<Vec<u8>> {
     let req_body = serde_json::to_vec(&json!({
         "book_id": book_id,
         "item_ids": item_ids,
@@ -54,17 +57,26 @@ pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiR
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let up = Upstream::new(ctx.up.clone());
-    let raw = up
-        .raw(&UpstreamRequestSpec {
-            mode: UpstreamMode::DeviceSigned,
-            raw_url: Some(FULL_MGET_URL.to_string()),
-            body: Some(req_body),
-            headers: dragon_read_json_headers(),
-            ..Default::default()
-        })
-        .await?;
+    up.raw(&UpstreamRequestSpec {
+        mode: UpstreamMode::DeviceSigned,
+        raw_url: Some(FULL_MGET_URL.to_string()),
+        body: Some(req_body),
+        headers: dragon_read_json_headers(),
+        ..Default::default()
+    })
+    .await
+}
 
-    let mut root: Value = crate::endpoints::util::raw_json(&raw)?;
+pub async fn get_chapters(ctx: &Ctx, book_id: &str, item_ids: &[String]) -> ApiResult<Value> {
+    let cm = Arc::new(
+        CM::new_off_thread()
+            .await
+            .map_err(|e| ApiError::Internal(format!("cm init: {e}")))?,
+    );
+    let key = cm.client_handshake();
+
+    let raw = fetch_full_mget_raw(ctx, book_id, item_ids, &key).await?;
+    let mut root = crate::endpoints::util::raw_json(&raw)?;
     drop(raw);
     // Inspect before mutating so the pass-through cases return the parsed root
     // untouched. The checks borrow immutably; the clone-free take below needs

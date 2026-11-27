@@ -107,6 +107,11 @@ void main() {
         expect(() => router.requireLocal(_u(path)), returnsNormally);
       }
     });
+
+    test('no book uses the remote full pilot', () {
+      expect(router.usesFullChapterPilot('123'), isFalse);
+      expect(router.fullChapterEndpoint('123'), isNull);
+    });
   });
 
   group('pinned local groups', () {
@@ -145,6 +150,95 @@ void main() {
       final url = _u('/api/v1/chapters/123');
       expect(router.backendFor(url), SourceBackend.local);
       expect(() => router.requireLocal(url), returnsNormally);
+    });
+  });
+
+  group('exact full-chapter pilot', () {
+    final router = SourceRouter(
+      config: const SourceRouterConfig(
+        remoteBaseUrl: 'https://source.example.invalid',
+        fullPilotBookIds: {'book-1', 'book-2'},
+      ),
+    );
+
+    test('only the listed books use the remote full endpoint', () {
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+      expect(router.usesFullChapterPilot('book-3'), isFalse);
+      expect(
+        router.fullChapterEndpoint('book-2').toString(),
+        'https://source.example.invalid/api/v1/chapters/full',
+      );
+    });
+
+    test('the pilot does not move other novel-content paths', () {
+      for (final path in [
+        '/api/v1/chapters/123',
+        '/api/v1/chapters/batch?item_ids=1,2',
+        '/api/v1/chapters/123/novel',
+        '/api/v1/chapters/123/toutiao',
+        '/api/v1/chapters/full?book_id=book-1&item_ids=1',
+      ]) {
+        expect(router.backendFor(_u(path)), SourceBackend.local, reason: path);
+        expect(() => router.requireLocal(_u(path)), returnsNormally);
+      }
+    });
+
+    test('plain HTTP is accepted only for a loopback test service', () {
+      final local = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18921',
+          fullPilotBookIds: {'book-1'},
+        ),
+      );
+      expect(
+        local.fullChapterEndpoint('book-1').toString(),
+        'http://127.0.0.1:18921/api/v1/chapters/full',
+      );
+
+      final insecure = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://source.example.invalid',
+          fullPilotBookIds: {'book-1'},
+        ),
+      );
+      expect(() => insecure.fullChapterEndpoint('book-1'), throwsStateError);
+
+      for (final base in [
+        'http://127.example.invalid',
+        'http://127.0.0.1.evil.invalid',
+      ]) {
+        final disguised = SourceRouter(
+          config: SourceRouterConfig(
+            remoteBaseUrl: base,
+            fullPilotBookIds: const {'book-1'},
+          ),
+        );
+        expect(
+          () => disguised.fullChapterEndpoint('book-1'),
+          throwsStateError,
+          reason: base,
+        );
+      }
+    });
+
+    test('a base URL with a path or query is rejected', () {
+      for (final base in [
+        'https:',
+        'https://source.example.invalid/prefix',
+        'https://source.example.invalid?x=1',
+      ]) {
+        final invalid = SourceRouter(
+          config: SourceRouterConfig(
+            remoteBaseUrl: base,
+            fullPilotBookIds: const {'book-1'},
+          ),
+        );
+        expect(
+          () => invalid.fullChapterEndpoint('book-1'),
+          throwsStateError,
+          reason: base,
+        );
+      }
     });
   });
 }

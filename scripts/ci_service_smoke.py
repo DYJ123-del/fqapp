@@ -39,6 +39,18 @@ HEALTH_TIMEOUT_SECONDS = 40
 HTTP_TIMEOUT_SECONDS = 10
 MOCK_BODY = b'{"code":0,"data":{"ok":true}}'
 MOCK_JSON_VALUE = {"code": 0, "data": {"ok": True}}
+FULL_RELAY_PATH = "/novelfm/playerapi/full/mget/v1/"
+FULL_RELAY_ITEM_ID = "chapter-1"
+FULL_RELAY_BODY = (
+    b'{"code":0,"data":{"item_infos":{"chapter-1":'
+    b'{"title":"Chapter","key":"peer-key","content":"ciphertext"}},"kept":true},'
+    b'"root_extra":"kept"}'
+)
+FULL_RELAY_BODY_LIMIT = 16 * 1024
+CLIENT_PUBLIC_KEY = base64.b64encode(b"\x02").decode("ascii")
+RELAY_AUTH_ENV = ("FQ_INSTALL_TOKEN", "FQ_INSTALL_SIGNING_KEY")
+CM_HANDSHAKE_KEY_ENV = "FQ_CM_HANDSHAKE_KEY"
+CM_HANDSHAKE_KEY = base64.b64encode(bytes(range(16))).decode("ascii")
 
 ALLOWED_GET_PATHS = (
     "/api/v1/books/123",
@@ -139,6 +151,7 @@ def build_fixtures(root: Path) -> Dict[str, Path]:
         {
             "algorithm_type": "8404",
             "port": 0,
+            "zwsm": "suffix",
             "anti_crawler": {"enabled": False, "redirect_url": ""},
             "network_proxy": {"enabled": False, "url": ""},
             "admin": {"token": "", "update_server_url": ""},
@@ -229,12 +242,13 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
     def _respond(self) -> None:
         path = urlsplit(self.path).path or "/"
         self.server.record(path)
+        body = FULL_RELAY_BODY if path == FULL_RELAY_PATH else MOCK_BODY
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(MOCK_BODY)))
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(MOCK_BODY)
+        self.wfile.write(body)
         self.close_connection = True
 
     def log_message(self, _format: str, *args: Any) -> None:
@@ -469,9 +483,14 @@ def start_service(
         "--mock-upstream",
         mock_origin,
     ]
+    environment = os.environ.copy()
+    for name in RELAY_AUTH_ENV:
+        environment.pop(name, None)
+    environment[CM_HANDSHAKE_KEY_ENV] = CM_HANDSHAKE_KEY
     return subprocess.Popen(
         command,
         cwd=str(root),
+        env=environment,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -540,15 +559,20 @@ def http_request(
     port: int,
     *,
     use_tls: bool,
+    body: Optional[bytes] = None,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, bytes]:
     scheme = "https" if use_tls else "http"
     url = f"{scheme}://127.0.0.1:{port}{path}"
-    data = b"" if method not in ("GET", "HEAD") else None
+    data = body if body is not None else (b"" if method not in ("GET", "HEAD") else None)
+    request_headers = {"Accept": "application/json", "Connection": "close"}
+    if headers:
+        request_headers.update(headers)
     request = urllib.request.Request(
         url,
         data=data,
         method=method,
-        headers={"Accept": "application/json", "Connection": "close"},
+        headers=request_headers,
     )
 
     handlers: List[Any] = [urllib.request.ProxyHandler({})]
@@ -845,9 +869,143 @@ def run_smoke(
         )
 
         upstream_after = mock.counts()
-        evidence["upstream_request_counts"] = upstream_baseline
         if upstream_after != upstream_baseline:
             raise SmokeError("a rejected request reached the upstream")
+
+        valid_full_request = json.dumps(
+            {
+                "book_id": "book-1",
+                "item_ids": [FULL_RELAY_ITEM_ID],
+                "client_public_key": CLIENT_PUBLIC_KEY,
+            }
+        ).encode("utf-8")
+        json_headers = {"Content-Type": "application/json"}
+
+        for method in ("GET", "OPTIONS"):
+            status, _ = http_request(
+                method,
+                "/api/v1/chapters/full",
+                tls_port,
+                use_tls=True,
+            )
+            record_check(
+                checks,
+                "full_relay_method",
+                method,
+                "/api/v1/chapters/full",
+                405,
+                status,
+            )
+
+        invalid_requests = (
+            ("bad json", b"{"),
+            (
+                "multiple items",
+                json.dumps(
+                    {
+                        "book_id": "book-1",
+                        "item_ids": [FULL_RELAY_ITEM_ID, "chapter-2"],
+                        "client_public_key": CLIENT_PUBLIC_KEY,
+                    }
+                ).encode("utf-8"),
+            ),
+            (
+                "bad client key",
+                json.dumps(
+                    {
+                        "book_id": "book-1",
+                        "item_ids": [FULL_RELAY_ITEM_ID],
+                        "client_public_key": "Ag",
+                    }
+                ).encode("utf-8"),
+            ),
+        )
+        for label, body in invalid_requests:
+            status, _ = http_request(
+                "POST",
+                "/api/v1/chapters/full",
+                tls_port,
+                use_tls=True,
+                body=body,
+                headers=json_headers,
+            )
+            record_check(
+                checks,
+                "full_relay_validation",
+                f"POST ({label})",
+                "/api/v1/chapters/full",
+                400,
+                status,
+            )
+
+        status, _ = http_request(
+            "POST",
+            "/api/v1/chapters/full",
+            tls_port,
+            use_tls=True,
+            body=b"x" * (FULL_RELAY_BODY_LIMIT + 1),
+            headers=json_headers,
+        )
+        record_check(
+            checks,
+            "full_relay_validation",
+            "POST (oversized)",
+            "/api/v1/chapters/full",
+            413,
+            status,
+        )
+        if mock.counts() != upstream_after:
+            raise SmokeError("a rejected Relay request reached the upstream")
+
+        upstream_before_success = mock.counts()
+        status, body = http_request(
+            "POST",
+            "/api/v1/chapters/full",
+            tls_port,
+            use_tls=True,
+            body=valid_full_request,
+            headers=json_headers,
+        )
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+        item = (
+            payload.get("data", {})
+            .get("item_infos", {})
+            .get(FULL_RELAY_ITEM_ID, {})
+            if isinstance(payload, dict)
+            else {}
+        )
+        relay_ok = (
+            isinstance(payload, dict)
+            and payload.get("code") == 0
+            and item.get("key") == "peer-key"
+            and item.get("content") == "ciphertext"
+            and payload.get("data", {}).get("kept") is True
+            and payload.get("root_extra") == "kept"
+            and payload.get("relay", {}).get("protocol") == 1
+            and payload.get("relay", {}).get("content_suffix") == "suffix"
+        )
+        checks.append(
+            {
+                "phase": "full_relay_success",
+                "method": "POST",
+                "path": "/api/v1/chapters/full",
+                "expected_status": 200,
+                "status": status,
+                "relay_metadata": relay_ok,
+                "passed": status == 200 and relay_ok,
+            }
+        )
+        upstream_after_success = mock.counts()
+        expected_counts = dict(upstream_before_success)
+        expected_counts[FULL_RELAY_PATH] = (
+            expected_counts.get(FULL_RELAY_PATH, 0) + 1
+        )
+        if upstream_after_success != expected_counts:
+            raise SmokeError("the successful Relay did not reach exactly one upstream request")
+        evidence["upstream_request_counts"] = upstream_after_success
 
         failed = [check for check in checks if not check["passed"]]
         if failed:
