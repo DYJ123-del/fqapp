@@ -1840,7 +1840,6 @@ class ApiClient {
             bookId: bookId,
             itemId: itemId,
             remotePayload: payload,
-            remoteText: text,
           ),
         );
       }
@@ -1866,7 +1865,6 @@ class ApiClient {
     required String bookId,
     required String itemId,
     required Map<String, dynamic> remotePayload,
-    required String remoteText,
   }) async {
     if (_fullResponseComparisonInFlight) return;
     _fullResponseComparisonInFlight = true;
@@ -1880,22 +1878,13 @@ class ApiClient {
         bytes.length,
         () => _decodeEnvelope(status, bytes),
       );
-      final data = localPayload['data'];
-      final itemInfos = data is Map ? data['item_infos'] : null;
-      final item = itemInfos is Map ? itemInfos[itemId] : null;
-      final localText = item is Map ? item['content'] : null;
-      if (localText is! String || localText.isEmpty) {
-        throw const ApiException('本地对照基准缺少正文');
-      }
       final comparison = compareFullChapterResponses(
         localPayload: localPayload,
         remotePayload: remotePayload,
         itemId: itemId,
-        localText: localText,
-        remoteText: remoteText,
       );
       if (comparison.matches) {
-        AppLog.d('source-compare', 'full json=ok text=ok');
+        AppLog.d('source-compare', 'full json=ok');
       } else {
         AppLog.w('source-compare', 'full 不一致 ${comparison.mismatch}');
       }

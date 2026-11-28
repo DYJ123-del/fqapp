@@ -38,8 +38,6 @@ void main() {
         localPayload: payload(),
         remotePayload: payload(relay: true),
         itemId: 'chapter-1',
-        localText: 'first\nsecond',
-        remoteText: 'alpha\nbeta',
       );
 
       expect(comparison.matches, isTrue);
@@ -50,24 +48,10 @@ void main() {
         localPayload: payload(),
         remotePayload: payload(includeTitle: false),
         itemId: 'chapter-1',
-        localText: 'first\nsecond',
-        remoteText: 'alpha\nbeta',
       );
 
       expect(comparison.mismatch, contains('item_infos.*.title'));
       expect(comparison.mismatch, isNot(contains('chapter-1')));
-    });
-
-    test('reports a paragraph-count mismatch', () {
-      final comparison = compareFullChapterResponses(
-        localPayload: payload(),
-        remotePayload: payload(),
-        itemId: 'chapter-1',
-        localText: 'first\nsecond',
-        remoteText: 'only-one-paragraph',
-      );
-
-      expect(comparison.mismatch, 'text:paragraphs');
     });
   });
 

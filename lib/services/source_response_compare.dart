@@ -1,42 +1,33 @@
 import 'dart:convert';
 
-import 'chapter_text_formatter.dart';
-
 /// Result of comparing a local and a remote response without retaining values.
 class SourceResponseComparison {
   const SourceResponseComparison.match() : mismatch = null;
   const SourceResponseComparison.mismatch(this.mismatch);
 
   /// Null when the structures agree. Otherwise a safe path such as
-  /// `json:$.data.item_infos.*.title` or `text:paragraphs`.
+  /// `json:$.data.item_infos.*.title`.
   final String? mismatch;
 
   bool get matches => mismatch == null;
 }
 
-/// Compares the local and remote `chapters/full` responses.
+/// Compares the local and remote `chapters/full` response shapes.
 ///
-/// Values are never compared or returned. `relay` is remote-only protocol
-/// metadata, and the item-id keys under `item_infos` are replaced by `*` so a
-/// mismatch path can be logged without a book or chapter id.
+/// Only fields and value types are compared; content values are never read or
+/// returned. `relay` is remote-only protocol metadata, and the item-id keys
+/// under `item_infos` are replaced by `*` so a mismatch path can be logged
+/// without a book or chapter id.
 SourceResponseComparison compareFullChapterResponses({
   required Map<String, dynamic> localPayload,
   required Map<String, dynamic> remotePayload,
   required String itemId,
-  required String localText,
-  required String remoteText,
 }) {
   final localShape = _responseShape(localPayload, itemId);
   final remoteShape = _responseShape(remotePayload, itemId);
   final jsonMismatch = _firstDifference(localShape, remoteShape, r'$');
   if (jsonMismatch != null) {
     return SourceResponseComparison.mismatch('json:$jsonMismatch');
-  }
-
-  final localParagraphs = splitChapterParagraphs(localText);
-  final remoteParagraphs = splitChapterParagraphs(remoteText);
-  if (localParagraphs.length != remoteParagraphs.length) {
-    return const SourceResponseComparison.mismatch('text:paragraphs');
   }
   return const SourceResponseComparison.match();
 }
