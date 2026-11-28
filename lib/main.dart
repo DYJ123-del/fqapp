@@ -66,7 +66,7 @@ import 'services/player_style_config.dart';
 import 'services/short_series_font_scale.dart';
 import 'services/playlet_share.dart';
 import 'services/poster_cache.dart';
-import 'services/source_router.dart';
+import 'services/source_policy_controller.dart';
 import 'services/shelf_group_store.dart';
 import 'services/shelf_store.dart';
 import 'services/shelf_view_store.dart';
@@ -313,7 +313,7 @@ Future<void> _loadLocalData() async {
   // 否则广播到达时 Dart 侧还没有处理函数，原生侧只能按“未处理”回。
   FairMemoryService.instance.init();
   final sp = await spFuture;
-  _applyRuntimeSourceRouting(sp);
+  _startSourcePolicy(sp);
   // Note: Optional preference schemas cannot block local data startup; see
   // .agents/notes/implemented/bug-fix/2026-09-17-persistent-data-and-web-cancellation.md.
   final savedTheme = sp.get(themeModeKey);
@@ -334,24 +334,22 @@ Future<void> _loadLocalData() async {
   DramaChannelPreferences.load(sp);
 }
 
-/// Applies the local override for A5 runtime source routing.
-///
-/// A missing key keeps the build-time default (all local in a normal release).
-/// A present but malformed value is a full local rollback, never a partial
-/// policy: the remote scopes must fail closed.
-void _applyRuntimeSourceRouting(SharedPreferences preferences) {
-  final raw = preferences.getString(SourceRuntimeConfig.preferenceKey);
-  if (raw == null) return;
-  try {
-    ApiClient.instance.applyRuntimeSourceConfig(
-      SourceRuntimeConfig.decode(raw),
-    );
-  } catch (error, stack) {
-    ApiClient.instance.applyRuntimeSourceConfig(
-      const SourceRuntimeConfig.allLocal(),
-    );
-    AppLog.w('startup', '远程源路由配置非法，已全部回退本地', error: error, stack: stack);
+SourcePolicyController? _sourcePolicyController;
+
+/// Starts the A5 runtime policy once. Bootstrap retries reuse the same
+/// controller so the lifecycle observer is never registered twice.
+void _startSourcePolicy(SharedPreferences preferences) {
+  final existing = _sourcePolicyController;
+  if (existing != null) {
+    existing.start();
+    return;
   }
+  final controller = SourcePolicyController(
+    api: ApiClient.instance,
+    preferences: preferences,
+  );
+  _sourcePolicyController = controller;
+  controller.start();
 }
 
 class FqApp extends StatefulWidget {

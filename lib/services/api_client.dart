@@ -38,6 +38,8 @@ import 'chapter_text_formatter.dart';
 import 'full_chapter_crypto.dart';
 import 'request_gate.dart';
 import 'source_router.dart';
+import 'source_policy.dart';
+import 'source_response_compare.dart';
 
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
@@ -190,6 +192,9 @@ class ApiClient {
   /// through the local FFI transport or its loopback capability.
   final http.Client _remoteClient;
 
+  /// At most one A5 local-vs-remote structure comparison may run at a time.
+  bool _fullResponseComparisonInFlight = false;
+
   /// 视频 tab（短剧 feed）的 cell id，按 tab_type 缓存：官方第二段
   /// `bookmall/cell/change` 必须带这个 tab 的 cell，而它只出现在第一段的响应里。
   /// 每个 tab 一个值，几天内都不会变；取不到时按老路径走，所以缓存过期只会
@@ -252,12 +257,18 @@ class ApiClient {
   /// reader uses this before choosing its metadata path.
   bool usesMangaPilot(String bookId) => _sourceRouter.usesMangaPilot(bookId);
 
+  /// Whether this build has an explicitly configured remote source origin.
+  bool get hasRemoteSource => _sourceRouter.hasRemoteSource;
+
   /// Applies a validated A5 routing policy to subsequent requests.
   ///
   /// The policy can only select the narrow full-chapter and manga-chapter
   /// scopes. Account and system requests stay pinned to the local core.
-  void applyRuntimeSourceConfig(SourceRuntimeConfig config) {
-    _sourceRouter.applyRuntimeConfig(config);
+  void applyRuntimeSourceConfig(
+    SourceRuntimeConfig config, {
+    DateTime? expiresAt,
+  }) {
+    _sourceRouter.applyRuntimeConfig(config, expiresAt: expiresAt);
   }
 
   /// Decodes and envelope-checks a response body.
@@ -396,15 +407,20 @@ class ApiClient {
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
 
-  Map<String, String> _remoteHeaders(Uri target, List<int> body) {
+  Map<String, String> _remoteHeaders(
+    Uri target,
+    List<int> body, {
+    String method = 'POST',
+  }) {
+    final verb = method.toUpperCase();
     final token = _sourceRouter.config.installToken;
     final signingKey = _sourceRouter.config.installSigningKey;
     final loopback = _isLoopbackHost(target.host);
     if (token == null && signingKey == null) {
       if (loopback) {
-        return const {
+        return {
           'Accept': 'application/json',
-          'Content-Type': 'application/json; charset=utf-8',
+          if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
         };
       }
       throw const ApiException('远程源服务未配置鉴权');
@@ -420,14 +436,14 @@ class ApiClient {
         .toString();
     final nonce = _randomHex(16);
     final bodyHash = sha256.convert(body).toString();
-    final canonical = 'POST\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
+    final canonical = '$verb\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
     final signature = Hmac(
       sha256,
       utf8.encode(signingKey),
     ).convert(utf8.encode(canonical)).toString();
     return {
       'Accept': 'application/json',
-      'Content-Type': 'application/json; charset=utf-8',
+      if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
       'Authorization': 'Bearer $token',
       'X-FQ-Timestamp': timestamp,
       'X-FQ-Nonce': nonce,
@@ -1818,6 +1834,15 @@ class ApiClient {
         'api',
         '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
       );
+      if (_sourceRouter.config.compareFullResponses) {
+        unawaited(
+          _compareRemoteFullResponse(
+            bookId: bookId,
+            itemId: itemId,
+            remotePayload: payload,
+          ),
+        );
+      }
       return ChapterContent.fromPlainText(text, illustrationsChecked: true);
     } catch (error) {
       watch.stop();
@@ -1828,6 +1853,88 @@ class ApiClient {
       rethrow;
     } finally {
       handshake.destroy();
+    }
+  }
+
+  /// A5-only local baseline for [remoteFullChapterContent].
+  ///
+  /// The local request is intentionally fire-and-forget. A comparison failure
+  /// never affects the remote result, and the log carries only safe field paths
+  /// and paragraph counts - never text, ids or keys.
+  Future<void> _compareRemoteFullResponse({
+    required String bookId,
+    required String itemId,
+    required Map<String, dynamic> remotePayload,
+  }) async {
+    if (_fullResponseComparisonInFlight) return;
+    _fullResponseComparisonInFlight = true;
+    try {
+      final response = await _get(
+        _url('/api/v1/chapters/full', {'book_id': bookId, 'item_ids': itemId}),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final localPayload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final comparison = compareFullChapterResponses(
+        localPayload: localPayload,
+        remotePayload: remotePayload,
+        itemId: itemId,
+      );
+      if (comparison.matches) {
+        AppLog.d('source-compare', 'full json=ok');
+      } else {
+        AppLog.w('source-compare', 'full 不一致 ${comparison.mismatch}');
+      }
+    } catch (error) {
+      AppLog.w('source-compare', 'full 对照失败 (${error.runtimeType})');
+    } finally {
+      _fullResponseComparisonInFlight = false;
+    }
+  }
+
+  /// Downloads the signed A5 runtime policy.
+  ///
+  /// The request is a bodyless GET and is logged only as a route template.
+  /// Any HTTP, envelope or schema failure escapes to the controller, which
+  /// keeps an unexpired cached policy or fails closed to all-local.
+  Future<RemoteSourcePolicy> fetchRemoteSourcePolicy() async {
+    final endpoint = _sourceRouter.clientPolicyEndpoint();
+    if (endpoint == null) {
+      throw StateError('Remote source policy endpoint is not configured');
+    }
+
+    final watch = Stopwatch()..start();
+    const route = 'GET /api/v1/client-policy';
+    try {
+      final response = await _remoteClient
+          .get(
+            endpoint,
+            headers: _remoteHeaders(endpoint, const [], method: 'GET'),
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final policy = RemoteSourcePolicy.fromJson(payload);
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
+      );
+      return policy;
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
     }
   }
 

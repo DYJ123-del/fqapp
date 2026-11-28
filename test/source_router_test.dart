@@ -1,9 +1,60 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:fqapp/services/api_client.dart';
+import 'package:fqapp/services/source_policy.dart';
+import 'package:fqapp/services/source_policy_controller.dart';
 import 'package:fqapp/services/source_router.dart';
+import 'package:fqapp/services/source_response_compare.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 Uri _u(String path) => Uri.parse('http://127.0.0.1:18921$path');
 
 void main() {
+  group('full response structure comparison', () {
+    Map<String, dynamic> payload({
+      bool relay = false,
+      bool includeTitle = true,
+    }) => {
+      'code': 0,
+      'msg': 'ok',
+      if (relay) 'relay': {'protocol': 1, 'content_suffix': 'x'},
+      'data': {
+        'book_id': 'book-1',
+        'item_infos': {
+          'chapter-1': {
+            if (includeTitle) 'title': 'title',
+            'key': 'key',
+            'content': 'content',
+          },
+        },
+      },
+    };
+
+    test('ignores relay and values while matching fields and text shape', () {
+      final comparison = compareFullChapterResponses(
+        localPayload: payload(),
+        remotePayload: payload(relay: true),
+        itemId: 'chapter-1',
+      );
+
+      expect(comparison.matches, isTrue);
+    });
+
+    test('reports a field path without exposing the item id', () {
+      final comparison = compareFullChapterResponses(
+        localPayload: payload(),
+        remotePayload: payload(includeTitle: false),
+        itemId: 'chapter-1',
+      );
+
+      expect(comparison.mismatch, contains('item_infos.*.title'));
+      expect(comparison.mismatch, isNot(contains('chapter-1')));
+    });
+  });
+
   group('classify', () {
     final cases = <String, SourceGroup>{
       // 小说正文
@@ -436,6 +487,41 @@ void main() {
       expect(router.usesFullChapterPilot('new-book'), isTrue);
     });
 
+    test('an expired runtime policy stops selecting the remote scope', () {
+      final router = SourceRouter(config: buildConfig)
+        ..applyRuntimeConfig(
+          SourceRuntimeConfig.decode(
+            '{"schema_version":1,"scopes":{"novel_full":{"backend":"remote"}}}',
+          ),
+          expiresAt: DateTime.now().subtract(const Duration(seconds: 1)),
+        );
+
+      expect(router.usesFullChapterPilot('any-book'), isFalse);
+    });
+
+    test('runtime policy serialization preserves remote book restrictions', () {
+      final config = SourceRuntimeConfig.decode(
+        '{"schema_version":1,"scopes":{'
+        '"novel_full":{"backend":"remote","book_ids":["book-2","book-1"]},'
+        '"manga_chapter":{"backend":"remote","book_ids":[]}}}',
+      );
+
+      expect(
+        SourceRuntimeConfig.fromJson(config.toJson()).toJson(),
+        config.toJson(),
+      );
+      expect(config.toJson(), {
+        'schema_version': 1,
+        'scopes': {
+          'novel_full': {
+            'backend': 'remote',
+            'book_ids': ['book-2', 'book-1'],
+          },
+          'manga_chapter': {'backend': 'remote', 'book_ids': <String>[]},
+        },
+      });
+    });
+
     test('malformed or unknown runtime contract values are rejected', () {
       for (final raw in [
         '',
@@ -461,5 +547,298 @@ void main() {
         );
       }
     });
+  });
+
+  group('remote source policy', () {
+    final now = DateTime.now().toUtc();
+    final future = now.add(const Duration(minutes: 5));
+
+    Map<String, Object?> remotePolicy({
+      required int expiresAt,
+      String backend = 'remote',
+      List<String> bookIds = const ['book-1'],
+    }) => {
+      'schema_version': 1,
+      'expires_at': expiresAt,
+      'scopes': {
+        'novel_full': {
+          'backend': backend,
+          if (backend == 'remote') 'book_ids': bookIds,
+        },
+        'manga_chapter': {'backend': 'local'},
+      },
+    };
+
+    http.Response jsonResponse(Object value) => http.Response(
+      jsonEncode(value),
+      200,
+      headers: const {'content-type': 'application/json; charset=utf-8'},
+    );
+
+    test('the policy envelope is strict and cannot name account routes', () {
+      final expiresAt = future.millisecondsSinceEpoch ~/ 1000;
+      for (final raw in <Object?>[
+        {'schema_version': 1, 'scopes': <String, Object?>{}},
+        {
+          ...remotePolicy(expiresAt: expiresAt),
+          'remote_base_url': 'https://source.example.invalid',
+        },
+        {...remotePolicy(expiresAt: expiresAt), 'schema_version': 2},
+        {...remotePolicy(expiresAt: expiresAt), 'expires_at': '$expiresAt'},
+        {
+          'schema_version': 1,
+          'expires_at': expiresAt,
+          'scopes': {
+            'account': {'backend': 'remote'},
+          },
+        },
+        {
+          'schema_version': 1,
+          'expires_at': expiresAt,
+          'scopes': {
+            'novel_full': {'backend': 'local', 'book_ids': <String>[]},
+          },
+        },
+      ]) {
+        expect(
+          () => RemoteSourcePolicy.fromJson(raw),
+          throwsFormatException,
+          reason: '$raw',
+        );
+      }
+    });
+
+    Future<SharedPreferences> preferences([
+      Map<String, Object>? initial,
+    ]) async {
+      SharedPreferences.setMockInitialValues(initial ?? {});
+      return SharedPreferences.getInstance();
+    }
+
+    ApiClient apiWith({
+      required SourceRouter router,
+      required http.Client remote,
+    }) {
+      final local = MockClient(
+        (request) => Future<http.Response>.error(
+          StateError('local core was called: ${request.url}'),
+        ),
+      );
+      addTearDown(local.close);
+      addTearDown(remote.close);
+      return ApiClient(
+        client: local,
+        baseUrl: 'http://127.0.0.1:18921',
+        remoteClient: remote,
+        sourceRouter: router,
+      );
+    }
+
+    test(
+      'a normal build performs no policy request and remains local',
+      () async {
+        var requests = 0;
+        final remote = MockClient((_) async {
+          requests++;
+          return jsonResponse(
+            remotePolicy(expiresAt: future.millisecondsSinceEpoch ~/ 1000),
+          );
+        });
+        final router = SourceRouter(config: const SourceRouterConfig());
+        final api = apiWith(router: router, remote: remote);
+        final controller = SourcePolicyController(
+          api: api,
+          preferences: await preferences(),
+          now: () => now,
+          observeLifecycle: false,
+        );
+        addTearDown(controller.dispose);
+
+        controller.start();
+        await controller.refresh();
+
+        expect(requests, 0);
+        expect(router.runtimeConfig.isPresent, isFalse);
+        expect(router.usesFullChapterPilot('book-1'), isFalse);
+      },
+    );
+
+    test('a valid policy is applied and cached before it is used', () async {
+      final expiresAt = future.millisecondsSinceEpoch ~/ 1000;
+      final remote = MockClient((request) async {
+        expect(request.method, 'GET');
+        expect(request.url.path, '/api/v1/client-policy');
+        expect(request.bodyBytes, isEmpty);
+        return jsonResponse(remotePolicy(expiresAt: expiresAt));
+      });
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+        ),
+      );
+      final prefs = await preferences();
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: prefs,
+        now: () => now,
+        observeLifecycle: false,
+      );
+      addTearDown(controller.dispose);
+
+      controller.start();
+      await controller.refresh();
+
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+      expect(router.usesFullChapterPilot('book-2'), isFalse);
+      final cached = RemoteSourcePolicy.decode(
+        prefs.getString(SourcePolicyController.cachePreferenceKey)!,
+      );
+      expect(cached.expiresAt, expiresAt);
+      expect(
+        cached.runtimeConfig.backendFor(SourceRouteScope.novelFull),
+        SourceBackend.remote,
+      );
+    });
+
+    test('an unexpired cached policy survives a refresh failure', () async {
+      final expiresAt = future.millisecondsSinceEpoch ~/ 1000;
+      final prefs = await preferences({
+        SourcePolicyController.cachePreferenceKey: jsonEncode(
+          remotePolicy(expiresAt: expiresAt),
+        ),
+      });
+      final remote = MockClient((_) async => http.Response('unavailable', 503));
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+        ),
+      );
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: prefs,
+        now: () => now,
+        observeLifecycle: false,
+      );
+      addTearDown(controller.dispose);
+
+      controller.start();
+      await controller.refresh();
+
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+      expect(
+        prefs.getString(SourcePolicyController.cachePreferenceKey),
+        isNotNull,
+      );
+    });
+
+    test('an expired cache and failed refresh fail closed to local', () async {
+      final expiredAt =
+          now.subtract(const Duration(minutes: 1)).millisecondsSinceEpoch ~/
+          1000;
+      final prefs = await preferences({
+        SourcePolicyController.cachePreferenceKey: jsonEncode(
+          remotePolicy(expiresAt: expiredAt),
+        ),
+      });
+      final remote = MockClient((_) async => http.Response('unavailable', 503));
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+        ),
+      );
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: prefs,
+        now: () => now,
+        observeLifecycle: false,
+      );
+      addTearDown(controller.dispose);
+
+      controller.start();
+      await controller.refresh();
+
+      expect(router.usesFullChapterPilot('book-1'), isFalse);
+      expect(router.runtimeConfig.isPresent, isTrue);
+      expect(
+        router.runtimeConfig.backendFor(SourceRouteScope.novelFull),
+        SourceBackend.local,
+      );
+      expect(
+        prefs.getString(SourcePolicyController.cachePreferenceKey),
+        isNull,
+      );
+    });
+
+    test('a downloaded all-local policy is the kill switch', () async {
+      final expiresAt = future.millisecondsSinceEpoch ~/ 1000;
+      final remote = MockClient(
+        (_) async =>
+            jsonResponse(remotePolicy(expiresAt: expiresAt, backend: 'local')),
+      );
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+          fullPilotBookIds: {'build-book'},
+        ),
+      );
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: await preferences(),
+        now: () => now,
+        observeLifecycle: false,
+      );
+      addTearDown(controller.dispose);
+
+      expect(router.usesFullChapterPilot('build-book'), isTrue);
+      controller.start();
+      await controller.refresh();
+
+      expect(router.usesFullChapterPilot('build-book'), isFalse);
+      expect(router.usesFullChapterPilot('book-1'), isFalse);
+    });
+
+    test(
+      'a local override beats both the cache and the server policy',
+      () async {
+        var requests = 0;
+        final remote = MockClient((_) async {
+          requests++;
+          return jsonResponse(
+            remotePolicy(
+              expiresAt: future.millisecondsSinceEpoch ~/ 1000,
+              backend: 'local',
+            ),
+          );
+        });
+        final router = SourceRouter(
+          config: const SourceRouterConfig(
+            remoteBaseUrl: 'http://127.0.0.1:18922',
+            fullPilotBookIds: {'build-book'},
+          ),
+        );
+        final api = apiWith(router: router, remote: remote);
+        final prefs = await preferences({
+          SourceRuntimeConfig.preferenceKey:
+              '{"schema_version":1,"scopes":{"novel_full":{"backend":"local"}}}',
+        });
+        final controller = SourcePolicyController(
+          api: api,
+          preferences: prefs,
+          now: () => now,
+          observeLifecycle: false,
+        );
+        addTearDown(controller.dispose);
+
+        controller.start();
+        await controller.refresh();
+
+        expect(requests, 0);
+        expect(router.usesFullChapterPilot('build-book'), isFalse);
+      },
+    );
   });
 }

@@ -88,6 +88,7 @@ class SourceRouterConfig {
     this.mangaPilotBookIds = const {},
     this.installToken,
     this.installSigningKey,
+    this.compareFullResponses = false,
   });
 
   /// Every group on the local core - the shipping default for A1.
@@ -97,7 +98,8 @@ class SourceRouterConfig {
       fullPilotBookIds = const {},
       mangaPilotBookIds = const {},
       installToken = null,
-      installSigningKey = null;
+      installSigningKey = null,
+      compareFullResponses = false;
 
   /// Reads the A3/A4-M build-only pilot configuration.
   ///
@@ -110,6 +112,9 @@ class SourceRouterConfig {
     const rawMangaBookIds = String.fromEnvironment('FQ_MANGA_PILOT_BOOK_IDS');
     const token = String.fromEnvironment('FQ_INSTALL_TOKEN');
     const signingKey = String.fromEnvironment('FQ_INSTALL_SIGNING_KEY');
+    const compareFullResponses = bool.fromEnvironment(
+      'FQ_COMPARE_FULL_RESPONSES',
+    );
     final baseUrl = rawBaseUrl.trim();
     return SourceRouterConfig(
       remoteBaseUrl: baseUrl.isEmpty ? null : baseUrl,
@@ -117,6 +122,7 @@ class SourceRouterConfig {
       mangaPilotBookIds: _parseIds(rawMangaBookIds),
       installToken: token.isEmpty ? null : token,
       installSigningKey: signingKey.isEmpty ? null : signingKey,
+      compareFullResponses: compareFullResponses,
     );
   }
 
@@ -136,6 +142,11 @@ class SourceRouterConfig {
   /// and never checked into the repository.
   final String? installToken;
   final String? installSigningKey;
+
+  /// A5 validation only: fetch the local `full` response after a successful
+  /// remote one and compare JSON fields and text structure. Disabled in normal
+  /// builds because it doubles the chapter request.
+  final bool compareFullResponses;
 
   /// The configured backend for [group], before the router's pinned-local
   /// overrides. Unlisted groups default to [SourceBackend.local].
@@ -192,8 +203,8 @@ class SourceRuntimeConfig {
        _backends = Map.unmodifiable(backends),
        _bookIds = Map.unmodifiable(bookIds);
 
-  /// SharedPreferences key reserved for the future runtime config downloader
-  /// and for controlled local overrides. The stored value contains no secrets.
+  /// SharedPreferences key for controlled local overrides. The stored value
+  /// contains no secrets and takes priority over a downloaded policy.
   static const String preferenceKey = 'source_routing_config_v1';
 
   factory SourceRuntimeConfig.fromJson(Object? raw) {
@@ -293,10 +304,37 @@ class SourceRuntimeConfig {
     return ids == null || ids.contains(bookId);
   }
 
+  /// Serializes this policy without an envelope expiry. Remote policy caching
+  /// adds `expires_at` in `RemoteSourcePolicy`.
+  Map<String, Object?> toJson() {
+    if (!_present) {
+      throw StateError('a missing runtime source policy cannot be serialized');
+    }
+    final scopes = <String, Object?>{};
+    for (final scope in SourceRouteScope.values) {
+      final backend = backendFor(scope);
+      if (backend == SourceBackend.local) {
+        scopes[_scopeToWire(scope)] = {'backend': 'local'};
+        continue;
+      }
+      final ids = _bookIds[scope];
+      scopes[_scopeToWire(scope)] = {
+        'backend': 'remote',
+        if (ids != null) 'book_ids': ids.toList(growable: false),
+      };
+    }
+    return {'schema_version': 1, 'scopes': scopes};
+  }
+
   static SourceRouteScope _scopeFromWire(String value) => switch (value) {
     'novel_full' => SourceRouteScope.novelFull,
     'manga_chapter' => SourceRouteScope.mangaChapter,
     _ => throw const FormatException('unknown source routing scope'),
+  };
+
+  static String _scopeToWire(SourceRouteScope scope) => switch (scope) {
+    SourceRouteScope.novelFull => 'novel_full',
+    SourceRouteScope.mangaChapter => 'manga_chapter',
   };
 
   static void _requireKeys(Map raw, Set<String> allowed, String label) {
@@ -316,12 +354,14 @@ class SourceRouter {
 
   final SourceRouterConfig _config;
   SourceRuntimeConfig _runtimeConfig;
+  DateTime? _runtimeExpiresAt;
 
   SourceRouterConfig get config => _config;
   SourceRuntimeConfig get runtimeConfig => _runtimeConfig;
 
   static const String remoteFullPath = '/api/v1/chapters/full';
   static const String remoteMangaChapterPath = '/api/v1/manga/chapter';
+  static const String remoteClientPolicyPath = '/api/v1/client-policy';
 
   /// Groups that configuration may never move off the local core.
   static const Set<SourceGroup> pinnedLocal = {
@@ -335,8 +375,9 @@ class SourceRouter {
   /// requests observe [config] immediately. Passing
   /// [SourceRuntimeConfig.allLocal] is the one-step circuit breaker back to the
   /// local core.
-  void applyRuntimeConfig(SourceRuntimeConfig config) {
+  void applyRuntimeConfig(SourceRuntimeConfig config, {DateTime? expiresAt}) {
     _runtimeConfig = config;
+    _runtimeExpiresAt = expiresAt;
   }
 
   /// Resolves the backend for [url]: the configured backend for its group,
@@ -381,6 +422,10 @@ class SourceRouter {
   bool _usesRemoteScope(SourceRouteScope scope, String bookId) {
     if (bookId.isEmpty || _config.remoteBaseUrl == null) return false;
     if (_runtimeConfig.isPresent) {
+      final expiresAt = _runtimeExpiresAt;
+      if (expiresAt != null && !DateTime.now().isBefore(expiresAt)) {
+        return false;
+      }
       return _runtimeConfig.backendFor(scope) == SourceBackend.remote &&
           _runtimeConfig.allowsBook(scope, bookId);
     }
@@ -408,6 +453,16 @@ class SourceRouter {
   Uri? mangaChapterEndpoint() {
     if (_config.remoteBaseUrl == null) return null;
     return _validatedRemoteEndpoint(remoteMangaChapterPath);
+  }
+
+  /// Whether this build has an explicitly configured remote origin.
+  bool get hasRemoteSource => _config.remoteBaseUrl != null;
+
+  /// Resolves the signed runtime-policy endpoint. No policy is fetched when a
+  /// build has no remote origin.
+  Uri? clientPolicyEndpoint() {
+    if (!hasRemoteSource) return null;
+    return _validatedRemoteEndpoint(remoteClientPolicyPath);
   }
 
   /// Shared validation for the two exact pilot endpoints. The remote service
