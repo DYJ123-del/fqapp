@@ -26,6 +26,9 @@ class SourcePolicyController with WidgetsBindingObserver {
   }) : _now = now ?? DateTime.now;
 
   static const String cachePreferenceKey = 'source_routing_policy_v1';
+  static const Duration _refreshRetry = Duration(seconds: 15);
+  static const int _minLeadSeconds = 5;
+  static const int _maxLeadSeconds = 60;
 
   final ApiClient api;
   final SharedPreferences preferences;
@@ -36,6 +39,7 @@ class SourcePolicyController with WidgetsBindingObserver {
   bool _localOverride = false;
   RemoteSourcePolicy? _appliedPolicy;
   Future<void>? _refreshFlight;
+  Timer? _refreshTimer;
 
   void start() {
     if (_started) return;
@@ -115,6 +119,7 @@ class SourcePolicyController with WidgetsBindingObserver {
         error: error,
         stack: stack,
       );
+      _scheduleRefresh(retrySoon: true);
     }
   }
 
@@ -127,6 +132,42 @@ class SourcePolicyController with WidgetsBindingObserver {
         isUtc: true,
       ),
     );
+    _scheduleRefresh();
+  }
+
+  /// Refreshes before expiry so a foreground session never silently ages out
+  /// of the remote policy. Failures retry quickly while the last good policy is
+  /// still valid; once it expires the router already fails closed to local.
+  void _scheduleRefresh({bool retrySoon = false}) {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    if (!_started ||
+        !observeLifecycle ||
+        _localOverride ||
+        !api.hasRemoteSource) {
+      return;
+    }
+
+    var delay = _refreshRetry;
+    final policy = _appliedPolicy;
+    if (!retrySoon && policy != null) {
+      final remaining =
+          policy.expiresAt - _now().millisecondsSinceEpoch ~/ 1000;
+      if (remaining > 0) {
+        var lead = remaining ~/ 5;
+        if (lead < _minLeadSeconds) lead = _minLeadSeconds;
+        if (lead > _maxLeadSeconds) lead = _maxLeadSeconds;
+        final untilRefresh = remaining - lead;
+        delay = untilRefresh > 0
+            ? Duration(seconds: untilRefresh)
+            : Duration.zero;
+      }
+    }
+
+    _refreshTimer = Timer(delay, () {
+      _refreshTimer = null;
+      unawaited(refresh());
+    });
   }
 
   RemoteSourcePolicy? _readCachedPolicy() {
@@ -147,10 +188,22 @@ class SourcePolicyController with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) unawaited(refresh());
+    if (state == AppLifecycleState.resumed) {
+      _refreshTimer?.cancel();
+      _refreshTimer = null;
+      unawaited(refresh());
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.detached) {
+      _refreshTimer?.cancel();
+      _refreshTimer = null;
+    }
   }
 
   void dispose() {
+    _started = false;
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
     if (observeLifecycle) {
       WidgetsBinding.instance.removeObserver(this);
     }
