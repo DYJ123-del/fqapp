@@ -57,6 +57,11 @@ on:
         description: Comma-separated book IDs allowed to use the remote manga-chapter pilot.
         required: false
         default: ''
+      compare_full_responses:
+        description: A5 validation only - compare local and remote full responses.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -458,6 +463,7 @@ jobs:
           FQ_REMOTE_BASE_URL: ${{ github.event.inputs.remote_source_base_url }}
           FQ_FULL_PILOT_BOOK_IDS: ${{ github.event.inputs.full_pilot_book_ids }}
           FQ_MANGA_PILOT_BOOK_IDS: ${{ github.event.inputs.manga_pilot_book_ids }}
+          FQ_COMPARE_FULL_RESPONSES: ${{ github.event.inputs.compare_full_responses || 'false' }}
           # Pilot credentials are build inputs, not repository contents. Keep
           # them out of ordinary pull-request artifacts; only a manually
           # dispatched remote-source build may embed them.
@@ -470,6 +476,7 @@ jobs:
             --dart-define=FQ_REMOTE_BASE_URL="${FQ_REMOTE_BASE_URL:-}" \
             --dart-define=FQ_FULL_PILOT_BOOK_IDS="${FQ_FULL_PILOT_BOOK_IDS:-}" \
             --dart-define=FQ_MANGA_PILOT_BOOK_IDS="${FQ_MANGA_PILOT_BOOK_IDS:-}" \
+            --dart-define=FQ_COMPARE_FULL_RESPONSES="${FQ_COMPARE_FULL_RESPONSES:-}" \
             --dart-define=FQ_INSTALL_TOKEN="${FQ_INSTALL_TOKEN:-}" \
             --dart-define=FQ_INSTALL_SIGNING_KEY="${FQ_INSTALL_SIGNING_KEY:-}"
 

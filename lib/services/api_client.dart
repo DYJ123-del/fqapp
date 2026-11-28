@@ -39,6 +39,7 @@ import 'full_chapter_crypto.dart';
 import 'request_gate.dart';
 import 'source_router.dart';
 import 'source_policy.dart';
+import 'source_response_compare.dart';
 
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
@@ -190,6 +191,9 @@ class ApiClient {
   /// The remote source endpoint is a separate HTTPS service, so it cannot go
   /// through the local FFI transport or its loopback capability.
   final http.Client _remoteClient;
+
+  /// At most one A5 local-vs-remote structure comparison may run at a time.
+  bool _fullResponseComparisonInFlight = false;
 
   /// 视频 tab（短剧 feed）的 cell id，按 tab_type 缓存：官方第二段
   /// `bookmall/cell/change` 必须带这个 tab 的 cell，而它只出现在第一段的响应里。
@@ -1830,6 +1834,16 @@ class ApiClient {
         'api',
         '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
       );
+      if (_sourceRouter.config.compareFullResponses) {
+        unawaited(
+          _compareRemoteFullResponse(
+            bookId: bookId,
+            itemId: itemId,
+            remotePayload: payload,
+            remoteText: text,
+          ),
+        );
+      }
       return ChapterContent.fromPlainText(text, illustrationsChecked: true);
     } catch (error) {
       watch.stop();
@@ -1840,6 +1854,55 @@ class ApiClient {
       rethrow;
     } finally {
       handshake.destroy();
+    }
+  }
+
+  /// A5-only local baseline for [remoteFullChapterContent].
+  ///
+  /// The local request is intentionally fire-and-forget. A comparison failure
+  /// never affects the remote result, and the log carries only safe field paths
+  /// and paragraph counts - never text, ids or keys.
+  Future<void> _compareRemoteFullResponse({
+    required String bookId,
+    required String itemId,
+    required Map<String, dynamic> remotePayload,
+    required String remoteText,
+  }) async {
+    if (_fullResponseComparisonInFlight) return;
+    _fullResponseComparisonInFlight = true;
+    try {
+      final response = await _get(
+        _url('/api/v1/chapters/full', {'book_id': bookId, 'item_ids': itemId}),
+      );
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final localPayload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final data = localPayload['data'];
+      final itemInfos = data is Map ? data['item_infos'] : null;
+      final item = itemInfos is Map ? itemInfos[itemId] : null;
+      final localText = item is Map ? item['content'] : null;
+      if (localText is! String || localText.isEmpty) {
+        throw const ApiException('本地对照基准缺少正文');
+      }
+      final comparison = compareFullChapterResponses(
+        localPayload: localPayload,
+        remotePayload: remotePayload,
+        itemId: itemId,
+        localText: localText,
+        remoteText: remoteText,
+      );
+      if (comparison.matches) {
+        AppLog.d('source-compare', 'full json=ok text=ok');
+      } else {
+        AppLog.w('source-compare', 'full 不一致 ${comparison.mismatch}');
+      }
+    } catch (error) {
+      AppLog.w('source-compare', 'full 对照失败 (${error.runtimeType})');
+    } finally {
+      _fullResponseComparisonInFlight = false;
     }
   }
 

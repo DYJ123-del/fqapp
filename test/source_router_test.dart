@@ -5,6 +5,7 @@ import 'package:fqapp/services/api_client.dart';
 import 'package:fqapp/services/source_policy.dart';
 import 'package:fqapp/services/source_policy_controller.dart';
 import 'package:fqapp/services/source_router.dart';
+import 'package:fqapp/services/source_response_compare.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,64 @@ import 'package:shared_preferences/shared_preferences.dart';
 Uri _u(String path) => Uri.parse('http://127.0.0.1:18921$path');
 
 void main() {
+  group('full response structure comparison', () {
+    Map<String, dynamic> payload({
+      bool relay = false,
+      bool includeTitle = true,
+    }) => {
+      'code': 0,
+      'msg': 'ok',
+      if (relay) 'relay': {'protocol': 1, 'content_suffix': 'x'},
+      'data': {
+        'book_id': 'book-1',
+        'item_infos': {
+          'chapter-1': {
+            if (includeTitle) 'title': 'title',
+            'key': 'key',
+            'content': 'content',
+          },
+        },
+      },
+    };
+
+    test('ignores relay and values while matching fields and text shape', () {
+      final comparison = compareFullChapterResponses(
+        localPayload: payload(),
+        remotePayload: payload(relay: true),
+        itemId: 'chapter-1',
+        localText: 'first\nsecond',
+        remoteText: 'alpha\nbeta',
+      );
+
+      expect(comparison.matches, isTrue);
+    });
+
+    test('reports a field path without exposing the item id', () {
+      final comparison = compareFullChapterResponses(
+        localPayload: payload(),
+        remotePayload: payload(includeTitle: false),
+        itemId: 'chapter-1',
+        localText: 'first\nsecond',
+        remoteText: 'alpha\nbeta',
+      );
+
+      expect(comparison.mismatch, contains('item_infos.*.title'));
+      expect(comparison.mismatch, isNot(contains('chapter-1')));
+    });
+
+    test('reports a paragraph-count mismatch', () {
+      final comparison = compareFullChapterResponses(
+        localPayload: payload(),
+        remotePayload: payload(),
+        itemId: 'chapter-1',
+        localText: 'first\nsecond',
+        remoteText: 'only-one-paragraph',
+      );
+
+      expect(comparison.mismatch, 'text:paragraphs');
+    });
+  });
+
   group('classify', () {
     final cases = <String, SourceGroup>{
       // 小说正文

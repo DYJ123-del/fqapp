@@ -88,6 +88,7 @@ class SourceRouterConfig {
     this.mangaPilotBookIds = const {},
     this.installToken,
     this.installSigningKey,
+    this.compareFullResponses = false,
   });
 
   /// Every group on the local core - the shipping default for A1.
@@ -97,7 +98,8 @@ class SourceRouterConfig {
       fullPilotBookIds = const {},
       mangaPilotBookIds = const {},
       installToken = null,
-      installSigningKey = null;
+      installSigningKey = null,
+      compareFullResponses = false;
 
   /// Reads the A3/A4-M build-only pilot configuration.
   ///
@@ -110,6 +112,9 @@ class SourceRouterConfig {
     const rawMangaBookIds = String.fromEnvironment('FQ_MANGA_PILOT_BOOK_IDS');
     const token = String.fromEnvironment('FQ_INSTALL_TOKEN');
     const signingKey = String.fromEnvironment('FQ_INSTALL_SIGNING_KEY');
+    const compareFullResponses = bool.fromEnvironment(
+      'FQ_COMPARE_FULL_RESPONSES',
+    );
     final baseUrl = rawBaseUrl.trim();
     return SourceRouterConfig(
       remoteBaseUrl: baseUrl.isEmpty ? null : baseUrl,
@@ -117,6 +122,7 @@ class SourceRouterConfig {
       mangaPilotBookIds: _parseIds(rawMangaBookIds),
       installToken: token.isEmpty ? null : token,
       installSigningKey: signingKey.isEmpty ? null : signingKey,
+      compareFullResponses: compareFullResponses,
     );
   }
 
@@ -136,6 +142,11 @@ class SourceRouterConfig {
   /// and never checked into the repository.
   final String? installToken;
   final String? installSigningKey;
+
+  /// A5 validation only: fetch the local `full` response after a successful
+  /// remote one and compare JSON fields and text structure. Disabled in normal
+  /// builds because it doubles the chapter request.
+  final bool compareFullResponses;
 
   /// The configured backend for [group], before the router's pinned-local
   /// overrides. Unlisted groups default to [SourceBackend.local].
