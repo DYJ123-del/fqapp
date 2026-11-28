@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart' show AppLifecycleState;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/services/api_client.dart';
 import 'package:fqapp/services/source_policy.dart';
@@ -699,6 +700,94 @@ void main() {
         cached.runtimeConfig.backendFor(SourceRouteScope.novelFull),
         SourceBackend.remote,
       );
+    });
+
+    testWidgets('a foreground policy refreshes before it expires', (
+      tester,
+    ) async {
+      var requests = 0;
+      final shortExpiry = now.add(const Duration(seconds: 10));
+      final remote = MockClient((_) async {
+        requests++;
+        return jsonResponse(
+          remotePolicy(
+            expiresAt: requests == 1
+                ? shortExpiry.millisecondsSinceEpoch ~/ 1000
+                : future.millisecondsSinceEpoch ~/ 1000,
+          ),
+        );
+      });
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+        ),
+      );
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: await preferences(),
+        now: () => now,
+      );
+
+      controller.start();
+      await controller.refresh();
+      expect(requests, 1);
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+
+      await tester.pump(const Duration(seconds: 4));
+      expect(requests, 1);
+
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pump();
+      expect(requests, 2);
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+
+      controller.dispose();
+      await tester.pump();
+    });
+
+    testWidgets('pausing stops the refresh and resuming refreshes at once', (
+      tester,
+    ) async {
+      var requests = 0;
+      final shortExpiry = now.add(const Duration(seconds: 10));
+      final remote = MockClient((_) async {
+        requests++;
+        return jsonResponse(
+          remotePolicy(
+            expiresAt: requests == 1
+                ? shortExpiry.millisecondsSinceEpoch ~/ 1000
+                : future.millisecondsSinceEpoch ~/ 1000,
+          ),
+        );
+      });
+      final router = SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+        ),
+      );
+      final api = apiWith(router: router, remote: remote);
+      final controller = SourcePolicyController(
+        api: api,
+        preferences: await preferences(),
+        now: () => now,
+      );
+
+      controller.start();
+      await controller.refresh();
+      expect(requests, 1);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump(const Duration(minutes: 1));
+      expect(requests, 1);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(requests, 2);
+      expect(router.usesFullChapterPilot('book-1'), isTrue);
+
+      controller.dispose();
+      await tester.pump();
     });
 
     test('an unexpired cached policy survives a refresh failure', () async {
