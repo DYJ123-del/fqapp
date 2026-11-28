@@ -5,6 +5,7 @@ import '../../models/chapter_media.dart';
 import '../../services/app_theme.dart';
 import '../home/home_design.dart';
 import '../reader/eink_image_provider.dart';
+import 'comic_encrypted_image_provider.dart';
 
 /// Default provider for one comic page: memory-only.
 ///
@@ -17,16 +18,21 @@ import '../reader/eink_image_provider.dart';
 /// `CachedNetworkImageProvider` maxWidth/maxHeight semantics; the
 /// `exact` default would stretch to 2048×8192).
 @visibleForTesting
-ImageProvider<Object> defaultComicImageProvider(ComicImage image) =>
-    ResizeImage(
-      NetworkImage(
-        image.url,
-        headers: image.headers.isEmpty ? null : image.headers,
-      ),
-      width: 2048,
-      height: 8192,
-      policy: ResizeImagePolicy.fit,
-    );
+ImageProvider<Object> defaultComicImageProvider(ComicImage image) {
+  final key = image.encryptKeyHex;
+  final ImageProvider<Object> base = key == null
+      ? NetworkImage(
+          image.url,
+          headers: image.headers.isEmpty ? null : image.headers,
+        )
+      : ComicEncryptedImageProvider(url: image.url, keyHex: key);
+  return ResizeImage(
+    base,
+    width: 2048,
+    height: 8192,
+    policy: ResizeImagePolicy.fit,
+  );
+}
 
 /// One comic page with loading / error placeholders in the home palette.
 ///
@@ -78,6 +84,7 @@ class _ComicImageTileState extends State<ComicImageTile> {
   void didUpdateWidget(covariant ComicImageTile oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.image.url != widget.image.url ||
+        oldWidget.image.encryptKeyHex != widget.image.encryptKeyHex ||
         oldWidget.providerFactory != widget.providerFactory) {
       _resolve();
     }

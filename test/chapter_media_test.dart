@@ -1,5 +1,10 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/chapter_media.dart';
+import 'package:fqapp/services/manga_image_crypto.dart';
 
 import 'support/audio_play_fixture.dart';
 
@@ -426,6 +431,39 @@ void main() {
       );
     }
   });
+
+  test(
+    'manga GCM decrypts the checked-in fixture and rejects tampering',
+    () async {
+      final fixture =
+          (jsonDecode(
+                    File(
+                      'rust/testdata/manga_image_fixture.json',
+                    ).readAsStringSync(),
+                  )
+                  as Map<String, dynamic>)['manga_image']
+              as Map<String, dynamic>;
+      final key = fixture['key_hex'] as String;
+      final wire = base64Decode(fixture['large_wire_b64'] as String);
+      final plain = await decryptMangaImage(wire, key);
+      expect(plain, base64Decode(fixture['large_plain_b64'] as String));
+
+      final tampered = Uint8List.fromList(wire);
+      tampered[tampered.length - 1] ^= 1;
+      await expectLater(
+        decryptMangaImage(tampered, key),
+        throwsA(isA<FormatException>()),
+      );
+      await expectLater(
+        decryptMangaImage(Uint8List(27), key),
+        throwsA(isA<FormatException>()),
+      );
+      await expectLater(
+        decryptMangaImage(wire, '00'),
+        throwsA(isA<FormatException>()),
+      );
+    },
+  );
 
   test('inner business errors win over otherwise valid media fields', () {
     for (final error in [

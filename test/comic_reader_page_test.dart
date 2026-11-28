@@ -9,8 +9,16 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:fqapp/models/chapter_media.dart';
 import 'package:fqapp/models/media_item.dart';
 import 'package:fqapp/pages/comic_reader_page.dart';
+import 'package:fqapp/services/api_client.dart';
 import 'package:fqapp/services/comic_page_layout.dart';
 import 'package:fqapp/services/library_store.dart';
+import 'package:fqapp/services/source_router.dart';
+import 'package:fqapp/widgets/comic/comic_image_tile.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart';
+import 'package:pointycastle/api.dart';
+import 'package:pointycastle/block/aes.dart';
+import 'package:pointycastle/block/modes/gcm.dart';
 
 import 'support/fakes.dart';
 
@@ -87,6 +95,41 @@ void main() {
     expect((noHeaders.imageProvider as NetworkImage).headers, isNull);
   });
 
+  testWidgets('comic tile rebuilds its provider when the key changes', (
+    tester,
+  ) async {
+    var calls = 0;
+    ImageProvider<Object> factory(ComicImage image) {
+      calls++;
+      return MemoryImage(_onePixelPng);
+    }
+
+    Widget tile(String key) => MaterialApp(
+      home: Scaffold(
+        body: ComicImageTile(
+          image: ComicImage(
+            url: 'https://images.test/encrypted.png',
+            encryptKeyHex: key,
+          ),
+          pageNumber: 1,
+          providerFactory: factory,
+        ),
+      ),
+    );
+
+    await tester.pumpWidget(
+      tile('404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f'),
+    );
+    await tester.pump();
+    expect(calls, 1);
+    await tester.pumpWidget(
+      tile('084c62edae6d27c93ecac110d890cf3fc0db7e81eebdea250e73844d411a0c84'),
+    );
+    await tester.pump();
+    expect(calls, 2);
+    await tester.pumpWidget(const SizedBox.shrink());
+  });
+
   testWidgets('default provider fetches capability URLs and displays them', (
     tester,
   ) async {
@@ -124,6 +167,163 @@ void main() {
     expect(requested, hasLength(1));
     expect(requested.single.path, contains('/_session/cap-launch-1/'));
     expect(find.text('正在加载第 1 页'), findsNothing);
+    expect(find.text('第 1 页加载失败'), findsNothing);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('pilot comic metadata uses the remote endpoint only', (
+    tester,
+  ) async {
+    var remoteCalls = 0;
+    var localCalls = 0;
+    final remote = MockClient((request) async {
+      remoteCalls++;
+      expect(request.url.path, '/api/v1/manga/chapter');
+      expect(jsonDecode(request.body), {'item_id': 'chapter-1'});
+      return http.Response.bytes(
+        utf8.encode(jsonEncode(_remoteComicEnvelope())),
+        200,
+      );
+    });
+    final local = MockClient((_) async {
+      localCalls++;
+      return http.Response('{}', 200);
+    });
+    addTearDown(remote.close);
+    addTearDown(local.close);
+    final api = ApiClient(
+      client: local,
+      remoteClient: remote,
+      baseUrl: 'http://127.0.0.1:18921',
+      sourceRouter: SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+          mangaPilotBookIds: {'comic-test'},
+        ),
+      ),
+    );
+    await tester.pumpWidget(
+      _app(
+        store: _ComicStore(),
+        provider: _providerFor(portrait),
+        useDefaultLoader: false,
+        apiClient: api,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(remoteCalls, 1);
+    expect(localCalls, 0);
+    expect(find.byKey(const ValueKey('comic-reader-pages')), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await _leave(tester);
+  });
+
+  testWidgets('pilot comic failures retry remotely without local fallback', (
+    tester,
+  ) async {
+    var remoteCalls = 0;
+    var localCalls = 0;
+    final remote = MockClient((_) async {
+      remoteCalls++;
+      return http.Response.bytes(
+        utf8.encode(
+          jsonEncode({
+            ..._remoteComicEnvelope(),
+            'relay': {'protocol': 2},
+          }),
+        ),
+        200,
+      );
+    });
+    final local = MockClient((_) async {
+      localCalls++;
+      return http.Response('{}', 200);
+    });
+    addTearDown(remote.close);
+    addTearDown(local.close);
+    final api = ApiClient(
+      client: local,
+      remoteClient: remote,
+      baseUrl: 'http://127.0.0.1:18921',
+      sourceRouter: SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'http://127.0.0.1:18922',
+          mangaPilotBookIds: {'comic-test'},
+        ),
+      ),
+    );
+    await tester.pumpWidget(
+      _app(
+        store: _ComicStore(),
+        provider: _providerFor(portrait),
+        useDefaultLoader: false,
+        apiClient: api,
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('加载失败'), findsOneWidget);
+    await tester.tap(find.text('重新加载本章'));
+    await tester.pumpAndSettle();
+    expect(remoteCalls, 2);
+    expect(localCalls, 0);
+    expect(find.text('加载失败'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+    await _leave(tester);
+  });
+
+  testWidgets('encrypted comic provider downloads and decrypts with only UA', (
+    tester,
+  ) async {
+    final requested = <Uri>[];
+    final headers = <Map<String, List<String>>>[];
+    final keyHex =
+        '404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f';
+    final key = _hexBytes(keyHex);
+    final nonce = Uint8List.fromList(List<int>.generate(12, (i) => i + 1));
+    final wire = _encryptMangaImage(_onePixelPng, key, nonce);
+    final previous = HttpOverrides.current;
+    HttpOverrides.global = _FakeImageHttpOverrides(
+      requested,
+      body: wire,
+      headers: headers,
+    );
+    addTearDown(() => HttpOverrides.global = previous);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ComicReaderPage(
+          bookId: 'comic-test',
+          title: '漫画',
+          chapters: _chapters,
+          startIndex: 0,
+          readerStore: _ComicStore(),
+          cache: MemoryChapterCache(),
+          chapterLoader: (_) async => [
+            ComicImage(
+              url: 'https://images.test/encrypted.png',
+              encryptKeyHex: keyHex,
+            ),
+          ],
+        ),
+      ),
+    );
+    await tester.pump();
+    await tester.runAsync(
+      () => Future<void>.delayed(const Duration(milliseconds: 300)),
+    );
+    await tester.pump();
+    expect(requested, hasLength(1));
+    expect(requested.single.host, 'images.test');
+    expect(headers.single['user-agent'], [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    ]);
+    expect(
+      headers.single.keys.any(
+        (name) =>
+            name.toLowerCase() == 'authorization' ||
+            name.toLowerCase().startsWith('x-fq-'),
+      ),
+      isFalse,
+    );
     expect(find.text('第 1 页加载失败'), findsNothing);
     expect(tester.takeException(), isNull);
   });
@@ -609,6 +809,37 @@ void main() {
   });
 }
 
+Map<String, dynamic> _remoteComicEnvelope() => {
+  'code': 0,
+  'data': {
+    'item_id': 'chapter-1',
+    'encrypt_key':
+        '404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f',
+    'pic_infos': [
+      {'pic_url': 'https://images.test/chapter-1/0.png'},
+      {'pic_url': 'https://images.test/chapter-1/1.png'},
+    ],
+  },
+  'relay': {'protocol': 1},
+};
+
+Uint8List _hexBytes(String value) {
+  final bytes = Uint8List(value.length ~/ 2);
+  for (var i = 0; i < bytes.length; i++) {
+    bytes[i] = int.parse(value.substring(i * 2, i * 2 + 2), radix: 16);
+  }
+  return bytes;
+}
+
+Uint8List _encryptMangaImage(Uint8List plain, Uint8List key, Uint8List nonce) {
+  final cipher = GCMBlockCipher(AESEngine())
+    ..init(true, AEADParameters(KeyParameter(key), 128, nonce, Uint8List(0)));
+  final encrypted = cipher.process(plain);
+  return Uint8List(nonce.length + encrypted.length)
+    ..setRange(0, nonce.length, nonce)
+    ..setRange(nonce.length, nonce.length + encrypted.length, encrypted);
+}
+
 final _chapters = [
   Chapter(itemId: 'chapter-1', title: '第一章', volumeName: ''),
   Chapter(itemId: 'chapter-2', title: '第二章', volumeName: ''),
@@ -656,6 +887,8 @@ Widget _app({
   required ReaderStore store,
   required ComicImageProviderFactory provider,
   ComicChapterLoader? loader,
+  bool useDefaultLoader = true,
+  ApiClient? apiClient,
   List<Chapter>? chapters,
   int startIndex = 0,
   double scale = 1,
@@ -672,8 +905,11 @@ Widget _app({
     readerStore: store,
     // 同上：测试不应打开真实的加密目录缓存。
     cache: MemoryChapterCache(),
-    chapterLoader: loader ?? (chapter) async => _images(chapter),
+    chapterLoader: useDefaultLoader
+        ? (loader ?? (chapter) async => _images(chapter))
+        : null,
     imageProviderFactory: provider,
+    apiClient: apiClient,
   ),
 );
 
@@ -771,19 +1007,23 @@ class _ComicStore implements ReaderStore {
 /// answers every image request with a valid 1x1 PNG so `NetworkImage`
 /// can decode without touching the network or any disk cache.
 class _FakeImageHttpOverrides extends HttpOverrides {
-  _FakeImageHttpOverrides(this.requested);
+  _FakeImageHttpOverrides(this.requested, {this.body, this.headers});
 
   final List<Uri> requested;
+  final Uint8List? body;
+  final List<Map<String, List<String>>>? headers;
 
   @override
   HttpClient createHttpClient(SecurityContext? context) =>
-      _FakeImageHttpClient(requested);
+      _FakeImageHttpClient(requested, body ?? _onePixelPng, headers);
 }
 
 class _FakeImageHttpClient implements HttpClient {
-  _FakeImageHttpClient(this.requested);
+  _FakeImageHttpClient(this.requested, this.body, this.headerSink);
 
   final List<Uri> requested;
+  final Uint8List body;
+  final List<Map<String, List<String>>>? headerSink;
   bool _autoUncompress = true;
 
   @override
@@ -795,7 +1035,9 @@ class _FakeImageHttpClient implements HttpClient {
   @override
   Future<HttpClientRequest> getUrl(Uri url) async {
     requested.add(url);
-    return _FakeImageHttpRequest();
+    final values = <String, List<String>>{};
+    headerSink?.add(values);
+    return _FakeImageHttpRequest(body, values);
   }
 
   @override
@@ -803,25 +1045,35 @@ class _FakeImageHttpClient implements HttpClient {
 }
 
 class _FakeImageHttpRequest implements HttpClientRequest {
-  final _headers = _FakeImageHttpHeaders();
+  _FakeImageHttpRequest(this._body, Map<String, List<String>> values)
+    : _headers = _FakeImageHttpHeaders(values);
+
+  final Uint8List _body;
+  final _FakeImageHttpHeaders _headers;
 
   @override
   HttpHeaders get headers => _headers;
 
   @override
-  Future<HttpClientResponse> close() async =>
-      _FakeImageHttpResponse(_onePixelPng);
+  Future<HttpClientResponse> close() async => _FakeImageHttpResponse(_body);
 
   @override
   dynamic noSuchMethod(Invocation invocation) => null; // Unused members: null is fine (e.g. compressionState means uncompressed).
 }
 
 class _FakeImageHttpHeaders implements HttpHeaders {
-  final _values = <String, List<String>>{};
+  _FakeImageHttpHeaders(this._values);
+
+  final Map<String, List<String>> _values;
 
   @override
   void add(String name, Object value, {bool preserveHeaderCase = false}) {
-    _values.putIfAbsent(name, () => []).add(value.toString());
+    _values.putIfAbsent(name.toLowerCase(), () => []).add(value.toString());
+  }
+
+  @override
+  void set(String name, Object value, {bool preserveHeaderCase = false}) {
+    _values[name.toLowerCase()] = [value.toString()];
   }
 
   @override

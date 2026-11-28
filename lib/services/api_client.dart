@@ -248,6 +248,10 @@ class ApiClient {
   bool usesRemoteFullChapter(String bookId) =>
       _sourceRouter.usesFullChapterPilot(bookId);
 
+  /// Whether [bookId] is in the exact A4-M manga-chapter pilot. The comic
+  /// reader uses this before choosing its metadata path.
+  bool usesMangaPilot(String bookId) => _sourceRouter.usesMangaPilot(bookId);
+
   /// Decodes and envelope-checks a response body.
   ///
   /// Small envelopes stay on the calling isolate — an isolate hop costs more
@@ -384,7 +388,7 @@ class ApiClient {
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
 
-  Map<String, String> _remoteFullHeaders(Uri target, List<int> body) {
+  Map<String, String> _remoteHeaders(Uri target, List<int> body) {
     final token = _sourceRouter.config.installToken;
     final signingKey = _sourceRouter.config.installSigningKey;
     final loopback = _isLoopbackHost(target.host);
@@ -395,13 +399,13 @@ class ApiClient {
           'Content-Type': 'application/json; charset=utf-8',
         };
       }
-      throw const ApiException('远程正文服务未配置鉴权');
+      throw const ApiException('远程源服务未配置鉴权');
     }
     if (token == null ||
         token.isEmpty ||
         signingKey == null ||
         signingKey.isEmpty) {
-      throw const ApiException('远程正文服务鉴权配置无效');
+      throw const ApiException('远程源服务鉴权配置无效');
     }
 
     final timestamp = (DateTime.now().millisecondsSinceEpoch ~/ 1000)
@@ -1549,6 +1553,114 @@ class ApiClient {
     });
   }
 
+  /// Loads the exact A4-M remote manga chapter.
+  ///
+  /// The service returns only image URLs and the chapter key; every image is
+  /// downloaded and decrypted by the app. A malformed response or failure here
+  /// never falls back to [comicImages] or the local core.
+  Future<List<ComicImage>> remoteComicImages(
+    String bookId,
+    String itemId,
+  ) async {
+    if (!_sourceRouter.usesMangaPilot(bookId)) {
+      throw StateError('Book is not in the remote manga pilot');
+    }
+    final endpoint = _sourceRouter.mangaChapterEndpoint();
+    if (endpoint == null) {
+      throw StateError('Remote manga endpoint is not configured');
+    }
+    final validId = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
+    if (!validId.hasMatch(bookId) || !validId.hasMatch(itemId)) {
+      throw const ApiException('漫画参数无效');
+    }
+
+    final watch = Stopwatch()..start();
+    const route = 'POST /api/v1/manga/chapter';
+    try {
+      final requestBody = Uint8List.fromList(
+        utf8.encode(jsonEncode({'item_id': itemId})),
+      );
+      final response = await _remoteClient
+          .post(
+            endpoint,
+            headers: _remoteHeaders(endpoint, requestBody),
+            body: requestBody,
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      if (payload['code'] != 0) {
+        throw const ApiException('远程漫画业务码异常');
+      }
+      final relay = payload['relay'];
+      if (relay is! Map || relay['protocol'] != 1) {
+        throw const ApiException('远程漫画协议不匹配');
+      }
+      final data = payload['data'];
+      if (data is! Map ||
+          data['item_id'] != itemId ||
+          data['pic_infos'] is! List) {
+        throw const ApiException('远程漫画缺少图片数据');
+      }
+      final key = data['encrypt_key'];
+      final keyPattern = RegExp(r'^[0-9a-fA-F]{64}$');
+      if (key is! String || !keyPattern.hasMatch(key)) {
+        throw const ApiException('远程漫画密钥无效');
+      }
+      final rawPages = data['pic_infos'] as List;
+      if (rawPages.isEmpty || rawPages.length > 64) {
+        throw const ApiException('远程漫画图片数量无效');
+      }
+      final pages = <ComicImage>[];
+      for (final rawPage in rawPages) {
+        final rawUrl = rawPage is Map ? rawPage['pic_url'] : null;
+        if (rawUrl is! String || !_isValidRemoteComicUrl(rawUrl)) {
+          throw const ApiException('远程漫画图片地址无效');
+        }
+        pages.add(ComicImage(url: rawUrl, encryptKeyHex: key.toLowerCase()));
+      }
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms '
+            'bytes=${bytes.length} images=${pages.length}',
+      );
+      return List.unmodifiable(pages);
+    } on ApiException catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      // Keep transport/JSON failures on the same typed path the reader already
+      // turns into its retryable error state.
+      throw const ApiException('远程漫画加载失败');
+    }
+  }
+
+  static bool _isValidRemoteComicUrl(String raw) {
+    if (raw.isEmpty || raw.trim() != raw) return false;
+    final uri = Uri.tryParse(raw);
+    if (uri == null ||
+        (uri.scheme != 'http' && uri.scheme != 'https') ||
+        uri.host.isEmpty ||
+        uri.userInfo.isNotEmpty) {
+      return false;
+    }
+    return uri.path != '/src' && !uri.path.startsWith('/src/');
+  }
+
   /// Text-reader variant that combines JSON decode, nested content lookup and
   /// HTML cleanup in one background-isolate pass.
   Future<String> contentText(
@@ -1647,7 +1759,7 @@ class ApiClient {
       final response = await _remoteClient
           .post(
             endpoint,
-            headers: _remoteFullHeaders(endpoint, requestBody),
+            headers: _remoteHeaders(endpoint, requestBody),
             body: requestBody,
           )
           .timeout(_timeout);
