@@ -12,6 +12,10 @@
 /// A4-M adds a second, independent pilot exception for
 /// `/api/v1/manga/chapter`; it does not move [SourceGroup.manga].
 ///
+/// A5 adds a validated runtime policy for exactly those two narrow scopes. It
+/// can switch them between local and remote, or fail closed to all-local, but
+/// it cannot select a whole [SourceGroup].
+///
 /// Selecting [SourceBackend.remote] for a whole group still makes
 /// [SourceRouter.requireLocal] throw a [StateError] instead of silently
 /// falling back, because the general remote executor is not implemented.
@@ -22,6 +26,8 @@
 /// plumbing (health probe, `/src` file service). Configuration cannot reroute
 /// either one - see [SourceRouter.backendFor].
 library;
+
+import 'dart:convert';
 
 /// Where one request group is served from.
 enum SourceBackend { local, remote }
@@ -137,14 +143,182 @@ class SourceRouterConfig {
       backends[group] ?? SourceBackend.local;
 }
 
+/// A narrow route that may be switched independently of its broad
+/// [SourceGroup].
+///
+/// A5 reuses only the paths whose remote response protocol is already
+/// implemented. It must not expose [SourceGroup.novelContent] or
+/// [SourceGroup.manga], because those groups also contain paths that still
+/// require the local core.
+enum SourceRouteScope { novelFull, mangaChapter }
+
+/// Validated runtime routing policy for the A5 scopes.
+///
+/// JSON schema version 1 has exactly this shape:
+///
+/// ```json
+/// {
+///   "schema_version": 1,
+///   "scopes": {
+///     "novel_full": {"backend": "remote", "book_ids": ["123"]},
+///     "manga_chapter": {"backend": "local"}
+///   }
+/// }
+/// ```
+///
+/// `book_ids` is optional for a remote scope. Omitting it makes every book in
+/// that scope eligible; supplying it, including an empty list, restricts the
+/// scope to those exact ids. A local scope may not carry `book_ids`.
+///
+/// Unknown keys, scopes, schema versions and backend values reject the whole
+/// document. The caller therefore applies [allLocal] instead of a partial
+/// policy. This type deliberately cannot express the account or system groups,
+/// a remote base URL, or install credentials.
+class SourceRuntimeConfig {
+  const SourceRuntimeConfig.none()
+    : _present = false,
+      _backends = const {},
+      _bookIds = const {};
+
+  const SourceRuntimeConfig.allLocal()
+    : _present = true,
+      _backends = const {},
+      _bookIds = const {};
+
+  SourceRuntimeConfig._({
+    required Map<SourceRouteScope, SourceBackend> backends,
+    required Map<SourceRouteScope, Set<String>> bookIds,
+  }) : _present = true,
+       _backends = Map.unmodifiable(backends),
+       _bookIds = Map.unmodifiable(bookIds);
+
+  /// SharedPreferences key reserved for the future runtime config downloader
+  /// and for controlled local overrides. The stored value contains no secrets.
+  static const String preferenceKey = 'source_routing_config_v1';
+
+  factory SourceRuntimeConfig.fromJson(Object? raw) {
+    if (raw is! Map) {
+      throw const FormatException('source routing config must be an object');
+    }
+    _requireKeys(raw, const {
+      'schema_version',
+      'scopes',
+    }, 'source routing config');
+    if (raw['schema_version'] != 1) {
+      throw const FormatException('unsupported source routing schema version');
+    }
+    final rawScopes = raw['scopes'];
+    if (rawScopes is! Map) {
+      throw const FormatException('source routing scopes must be an object');
+    }
+
+    final backends = <SourceRouteScope, SourceBackend>{};
+    final bookIds = <SourceRouteScope, Set<String>>{};
+    for (final entry in rawScopes.entries) {
+      final rawScope = entry.key;
+      if (rawScope is! String) {
+        throw const FormatException('source routing scope must be a string');
+      }
+      final scope = _scopeFromWire(rawScope);
+      final rawPolicy = entry.value;
+      if (rawPolicy is! Map) {
+        throw FormatException('$rawScope policy must be an object');
+      }
+      _requireKeys(rawPolicy, const {
+        'backend',
+        'book_ids',
+      }, '$rawScope policy');
+
+      final backend = switch (rawPolicy['backend']) {
+        'local' => SourceBackend.local,
+        'remote' => SourceBackend.remote,
+        _ => throw FormatException('$rawScope backend is invalid'),
+      };
+      final rawBookIds = rawPolicy['book_ids'];
+      if (backend == SourceBackend.local) {
+        if (rawBookIds != null) {
+          throw FormatException('$rawScope local scope cannot list book ids');
+        }
+        backends[scope] = backend;
+        continue;
+      }
+
+      backends[scope] = backend;
+      if (rawBookIds == null) continue;
+      if (rawBookIds is! List) {
+        throw FormatException('$rawScope book_ids must be a list');
+      }
+      final ids = <String>{};
+      for (final rawId in rawBookIds) {
+        if (rawId is! String ||
+            rawId.trim() != rawId ||
+            !_bookIdPattern.hasMatch(rawId)) {
+          throw FormatException('$rawScope contains an invalid book id');
+        }
+        if (!ids.add(rawId)) {
+          throw FormatException('$rawScope contains a duplicate book id');
+        }
+      }
+      bookIds[scope] = Set.unmodifiable(ids);
+    }
+
+    return SourceRuntimeConfig._(backends: backends, bookIds: bookIds);
+  }
+
+  /// Decodes the JSON value stored under [preferenceKey].
+  ///
+  /// Throws [FormatException] for empty text, malformed JSON or any contract
+  /// violation. The startup loader turns that failure into [allLocal].
+  static SourceRuntimeConfig decode(String raw) {
+    if (raw.trim().isEmpty) {
+      throw const FormatException('source routing config is empty');
+    }
+    return SourceRuntimeConfig.fromJson(jsonDecode(raw));
+  }
+
+  /// Whether a runtime policy was supplied. A missing policy ([none]) leaves
+  /// the build-time A3/A4-M pilot configuration in effect; an explicit
+  /// [allLocal] policy is the kill switch and overrides it.
+  final bool _present;
+  final Map<SourceRouteScope, SourceBackend> _backends;
+  final Map<SourceRouteScope, Set<String>> _bookIds;
+
+  bool get isPresent => _present;
+
+  SourceBackend backendFor(SourceRouteScope scope) =>
+      _backends[scope] ?? SourceBackend.local;
+
+  bool allowsBook(SourceRouteScope scope, String bookId) {
+    final ids = _bookIds[scope];
+    return ids == null || ids.contains(bookId);
+  }
+
+  static SourceRouteScope _scopeFromWire(String value) => switch (value) {
+    'novel_full' => SourceRouteScope.novelFull,
+    'manga_chapter' => SourceRouteScope.mangaChapter,
+    _ => throw const FormatException('unknown source routing scope'),
+  };
+
+  static void _requireKeys(Map raw, Set<String> allowed, String label) {
+    for (final key in raw.keys) {
+      if (key is! String || !allowed.contains(key)) {
+        throw FormatException('$label contains an unknown key');
+      }
+    }
+  }
+}
+
 /// Classifies request paths and resolves them to a backend.
 class SourceRouter {
-  SourceRouter({SourceRouterConfig? config})
-    : _config = config ?? SourceRouterConfig.fromEnvironment();
+  SourceRouter({SourceRouterConfig? config, SourceRuntimeConfig? runtimeConfig})
+    : _config = config ?? SourceRouterConfig.fromEnvironment(),
+      _runtimeConfig = runtimeConfig ?? const SourceRuntimeConfig.none();
 
   final SourceRouterConfig _config;
+  SourceRuntimeConfig _runtimeConfig;
 
   SourceRouterConfig get config => _config;
+  SourceRuntimeConfig get runtimeConfig => _runtimeConfig;
 
   static const String remoteFullPath = '/api/v1/chapters/full';
   static const String remoteMangaChapterPath = '/api/v1/manga/chapter';
@@ -154,6 +328,16 @@ class SourceRouter {
     SourceGroup.account,
     SourceGroup.system,
   };
+
+  /// Applies a validated runtime policy to subsequent routing decisions.
+  ///
+  /// An in-flight remote request keeps the decision it already made; new
+  /// requests observe [config] immediately. Passing
+  /// [SourceRuntimeConfig.allLocal] is the one-step circuit breaker back to the
+  /// local core.
+  void applyRuntimeConfig(SourceRuntimeConfig config) {
+    _runtimeConfig = config;
+  }
 
   /// Resolves the backend for [url]: the configured backend for its group,
   /// except [pinnedLocal] groups, which always resolve to local.
@@ -176,23 +360,37 @@ class SourceRouter {
     }
   }
 
-  /// Whether [bookId] may use the exact A3 remote full-chapter path.
+  /// Whether [bookId] may use the exact remote full-chapter path.
   ///
   /// This is deliberately narrower than [backendFor]: it never changes the
-  /// backend of the rest of [SourceGroup.novelContent].
+  /// backend of the rest of [SourceGroup.novelContent]. Without a runtime
+  /// policy this is the A3 build-time pilot allowlist; an A5 policy replaces
+  /// that decision for this scope.
   bool usesFullChapterPilot(String bookId) =>
-      bookId.isNotEmpty &&
-      _config.remoteBaseUrl != null &&
-      _config.fullPilotBookIds.contains(bookId);
+      _usesRemoteScope(SourceRouteScope.novelFull, bookId);
 
-  /// Whether [bookId] may use the exact A4-M remote manga-chapter path.
+  /// Whether [bookId] may use the exact remote manga-chapter path.
   ///
   /// This is deliberately narrower than [backendFor]: it never changes the
-  /// backend of the rest of [SourceGroup.manga].
+  /// backend of the rest of [SourceGroup.manga]. Without a runtime policy this
+  /// is the A4-M build-time pilot allowlist; an A5 policy replaces that
+  /// decision for this scope.
   bool usesMangaPilot(String bookId) =>
-      bookId.isNotEmpty &&
-      _config.remoteBaseUrl != null &&
-      _config.mangaPilotBookIds.contains(bookId);
+      _usesRemoteScope(SourceRouteScope.mangaChapter, bookId);
+
+  bool _usesRemoteScope(SourceRouteScope scope, String bookId) {
+    if (bookId.isEmpty || _config.remoteBaseUrl == null) return false;
+    if (_runtimeConfig.isPresent) {
+      return _runtimeConfig.backendFor(scope) == SourceBackend.remote &&
+          _runtimeConfig.allowsBook(scope, bookId);
+    }
+    return switch (scope) {
+      SourceRouteScope.novelFull => _config.fullPilotBookIds.contains(bookId),
+      SourceRouteScope.mangaChapter => _config.mangaPilotBookIds.contains(
+        bookId,
+      ),
+    };
+  }
 
   /// Resolves the remote full-chapter endpoint for [bookId], or null when the
   /// book is not in the pilot.
@@ -328,6 +526,8 @@ Set<String> _parseIds(String raw) => Set.unmodifiable(
       .map((value) => value.trim())
       .where((value) => value.isNotEmpty),
 );
+
+final RegExp _bookIdPattern = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
 
 bool _isDecimalOctet(String value) {
   if (value.isEmpty || value.length > 3) return false;

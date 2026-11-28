@@ -316,4 +316,150 @@ void main() {
       }
     });
   });
+
+  group('runtime source routing', () {
+    const buildConfig = SourceRouterConfig(
+      remoteBaseUrl: 'https://source.example.invalid',
+      fullPilotBookIds: {'build-full'},
+      mangaPilotBookIds: {'build-manga'},
+    );
+
+    test('a missing runtime policy keeps the build-time pilot', () {
+      final router = SourceRouter(config: buildConfig);
+
+      expect(router.runtimeConfig.isPresent, isFalse);
+      expect(router.usesFullChapterPilot('build-full'), isTrue);
+      expect(router.usesMangaPilot('build-manga'), isTrue);
+      expect(router.usesFullChapterPilot('other'), isFalse);
+    });
+
+    test('a remote scope without book ids covers every book', () {
+      final router = SourceRouter(
+        config: buildConfig,
+        runtimeConfig: SourceRuntimeConfig.decode(
+          '{"schema_version":1,"scopes":{'
+          '"novel_full":{"backend":"remote"},'
+          '"manga_chapter":{"backend":"local"}}}',
+        ),
+      );
+
+      expect(router.usesFullChapterPilot('any-book'), isTrue);
+      expect(router.usesFullChapterPilot('build-full'), isTrue);
+      expect(router.usesMangaPilot('build-manga'), isFalse);
+      expect(
+        router.fullChapterEndpoint('any-book').toString(),
+        'https://source.example.invalid/api/v1/chapters/full',
+      );
+    });
+
+    test(
+      'book ids restrict a remote scope, and an empty list selects none',
+      () {
+        final router = SourceRouter(
+          config: buildConfig,
+          runtimeConfig: SourceRuntimeConfig.decode(
+            '{"schema_version":1,"scopes":{'
+            '"novel_full":{"backend":"remote","book_ids":["book-1","book-2"]},'
+            '"manga_chapter":{"backend":"remote","book_ids":[]}}}',
+          ),
+        );
+
+        expect(router.usesFullChapterPilot('book-1'), isTrue);
+        expect(router.usesFullChapterPilot('book-2'), isTrue);
+        expect(router.usesFullChapterPilot('book-3'), isFalse);
+        expect(router.usesFullChapterPilot('build-full'), isFalse);
+        expect(router.usesMangaPilot('book-1'), isFalse);
+      },
+    );
+
+    test(
+      'an explicit local policy and the all-local policy override pilots',
+      () {
+        final explicitLocal = SourceRouter(
+          config: buildConfig,
+          runtimeConfig: SourceRuntimeConfig.decode(
+            '{"schema_version":1,"scopes":{'
+            '"novel_full":{"backend":"local"},'
+            '"manga_chapter":{"backend":"remote"}}}',
+          ),
+        );
+        expect(explicitLocal.usesFullChapterPilot('build-full'), isFalse);
+        expect(explicitLocal.usesMangaPilot('any-manga'), isTrue);
+
+        final allLocal = SourceRouter(
+          config: buildConfig,
+          runtimeConfig: const SourceRuntimeConfig.allLocal(),
+        );
+        expect(allLocal.usesFullChapterPilot('build-full'), isFalse);
+        expect(allLocal.usesMangaPilot('build-manga'), isFalse);
+      },
+    );
+
+    test('narrow runtime scopes never move broad or pinned-local paths', () {
+      final router = SourceRouter(
+        config: buildConfig,
+        runtimeConfig: SourceRuntimeConfig.decode(
+          '{"schema_version":1,"scopes":{'
+          '"novel_full":{"backend":"remote"},'
+          '"manga_chapter":{"backend":"remote"}}}',
+        ),
+      );
+
+      for (final path in [
+        '/api/v1/chapters/123',
+        '/api/v1/chapters/batch?item_ids=1,2',
+        '/api/v1/manga/123',
+        '/api/v1/manga/videos/9',
+        '/api/v1/account/fanqie/library',
+        '/health',
+        '/src/x.mp4',
+      ]) {
+        expect(router.backendFor(_u(path)), SourceBackend.local, reason: path);
+        expect(() => router.requireLocal(_u(path)), returnsNormally);
+      }
+    });
+
+    test('applyRuntimeConfig changes subsequent decisions immediately', () {
+      final router = SourceRouter(config: buildConfig);
+      expect(router.usesFullChapterPilot('build-full'), isTrue);
+
+      router.applyRuntimeConfig(const SourceRuntimeConfig.allLocal());
+      expect(router.usesFullChapterPilot('build-full'), isFalse);
+
+      router.applyRuntimeConfig(
+        SourceRuntimeConfig.decode(
+          '{"schema_version":1,"scopes":{'
+          '"novel_full":{"backend":"remote"}}}',
+        ),
+      );
+      expect(router.usesFullChapterPilot('build-full'), isTrue);
+      expect(router.usesFullChapterPilot('new-book'), isTrue);
+    });
+
+    test('malformed or unknown runtime contract values are rejected', () {
+      for (final raw in [
+        '',
+        '{',
+        '{"schema_version":2,"scopes":{}}',
+        '{"schema_version":1,"scopes":[]}',
+        '{"schema_version":1,"scopes":{"account":{"backend":"remote"}}}',
+        '{"schema_version":1,"scopes":{"novel_full":{"backend":"cloud"}}}',
+        '{"schema_version":1,"scopes":{"novel_full":{"book_ids":[]}}}',
+        '{"schema_version":1,"scopes":{'
+            '"novel_full":{"backend":"local","book_ids":[]}}}',
+        '{"schema_version":1,"scopes":{'
+            '"novel_full":{"backend":"remote","book_ids":["book 1"]}}}',
+        '{"schema_version":1,"scopes":{'
+            '"novel_full":{"backend":"remote","book_ids":["book-1","book-1"]}}}',
+        '{"schema_version":1,"scopes":{},'
+            '"remote_base_url":"https://source.example.invalid"}',
+      ]) {
+        expect(
+          () => SourceRuntimeConfig.decode(raw),
+          throwsFormatException,
+          reason: raw,
+        );
+      }
+    });
+  });
 }
