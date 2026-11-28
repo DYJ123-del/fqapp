@@ -252,6 +252,14 @@ class ApiClient {
   /// reader uses this before choosing its metadata path.
   bool usesMangaPilot(String bookId) => _sourceRouter.usesMangaPilot(bookId);
 
+  /// Applies a validated A5 routing policy to subsequent requests.
+  ///
+  /// The policy can only select the narrow full-chapter and manga-chapter
+  /// scopes. Account and system requests stay pinned to the local core.
+  void applyRuntimeSourceConfig(SourceRuntimeConfig config) {
+    _sourceRouter.applyRuntimeConfig(config);
+  }
+
   /// Decodes and envelope-checks a response body.
   ///
   /// Small envelopes stay on the calling isolate — an isolate hop costs more
