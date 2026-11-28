@@ -38,6 +38,7 @@ import 'chapter_text_formatter.dart';
 import 'full_chapter_crypto.dart';
 import 'request_gate.dart';
 import 'source_router.dart';
+import 'source_policy.dart';
 
 export '../models/homepage_page.dart';
 part 'reader_video_api.dart';
@@ -252,12 +253,18 @@ class ApiClient {
   /// reader uses this before choosing its metadata path.
   bool usesMangaPilot(String bookId) => _sourceRouter.usesMangaPilot(bookId);
 
+  /// Whether this build has an explicitly configured remote source origin.
+  bool get hasRemoteSource => _sourceRouter.hasRemoteSource;
+
   /// Applies a validated A5 routing policy to subsequent requests.
   ///
   /// The policy can only select the narrow full-chapter and manga-chapter
   /// scopes. Account and system requests stay pinned to the local core.
-  void applyRuntimeSourceConfig(SourceRuntimeConfig config) {
-    _sourceRouter.applyRuntimeConfig(config);
+  void applyRuntimeSourceConfig(
+    SourceRuntimeConfig config, {
+    DateTime? expiresAt,
+  }) {
+    _sourceRouter.applyRuntimeConfig(config, expiresAt: expiresAt);
   }
 
   /// Decodes and envelope-checks a response body.
@@ -396,15 +403,20 @@ class ApiClient {
   String _url(String path, Map<String, String> query) =>
       Uri.parse(_base).resolve(path).replace(queryParameters: query).toString();
 
-  Map<String, String> _remoteHeaders(Uri target, List<int> body) {
+  Map<String, String> _remoteHeaders(
+    Uri target,
+    List<int> body, {
+    String method = 'POST',
+  }) {
+    final verb = method.toUpperCase();
     final token = _sourceRouter.config.installToken;
     final signingKey = _sourceRouter.config.installSigningKey;
     final loopback = _isLoopbackHost(target.host);
     if (token == null && signingKey == null) {
       if (loopback) {
-        return const {
+        return {
           'Accept': 'application/json',
-          'Content-Type': 'application/json; charset=utf-8',
+          if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
         };
       }
       throw const ApiException('远程源服务未配置鉴权');
@@ -420,14 +432,14 @@ class ApiClient {
         .toString();
     final nonce = _randomHex(16);
     final bodyHash = sha256.convert(body).toString();
-    final canonical = 'POST\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
+    final canonical = '$verb\n${target.path}\n$timestamp\n$nonce\n$bodyHash';
     final signature = Hmac(
       sha256,
       utf8.encode(signingKey),
     ).convert(utf8.encode(canonical)).toString();
     return {
       'Accept': 'application/json',
-      'Content-Type': 'application/json; charset=utf-8',
+      if (verb != 'GET') 'Content-Type': 'application/json; charset=utf-8',
       'Authorization': 'Bearer $token',
       'X-FQ-Timestamp': timestamp,
       'X-FQ-Nonce': nonce,
@@ -1828,6 +1840,49 @@ class ApiClient {
       rethrow;
     } finally {
       handshake.destroy();
+    }
+  }
+
+  /// Downloads the signed A5 runtime policy.
+  ///
+  /// The request is a bodyless GET and is logged only as a route template.
+  /// Any HTTP, envelope or schema failure escapes to the controller, which
+  /// keeps an unexpired cached policy or fails closed to all-local.
+  Future<RemoteSourcePolicy> fetchRemoteSourcePolicy() async {
+    final endpoint = _sourceRouter.clientPolicyEndpoint();
+    if (endpoint == null) {
+      throw StateError('Remote source policy endpoint is not configured');
+    }
+
+    final watch = Stopwatch()..start();
+    const route = 'GET /api/v1/client-policy';
+    try {
+      final response = await _remoteClient
+          .get(
+            endpoint,
+            headers: _remoteHeaders(endpoint, const [], method: 'GET'),
+          )
+          .timeout(_timeout);
+      final status = response.statusCode;
+      final bytes = response.bodyBytes;
+      final payload = await decodeResponseBody(
+        bytes.length,
+        () => _decodeEnvelope(status, bytes),
+      );
+      final policy = RemoteSourcePolicy.fromJson(payload);
+      watch.stop();
+      AppLog.d(
+        'api',
+        '$route $status ${watch.elapsedMilliseconds}ms bytes=${bytes.length}',
+      );
+      return policy;
+    } catch (error) {
+      watch.stop();
+      AppLog.w(
+        'api',
+        '$route 失败 ${watch.elapsedMilliseconds}ms (${error.runtimeType})',
+      );
+      rethrow;
     }
   }
 

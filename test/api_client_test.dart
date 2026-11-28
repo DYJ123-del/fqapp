@@ -863,6 +863,74 @@ void main() {
     }
   });
 
+  test('remote source policy uses a signed bodyless GET', () async {
+    final expiresAt = DateTime.now().millisecondsSinceEpoch ~/ 1000 + 300;
+    final remoteRequests = <http.Request>[];
+    final remote = MockClient((request) async {
+      remoteRequests.add(request);
+      return http.Response.bytes(
+        utf8.encode(
+          jsonEncode({
+            'schema_version': 1,
+            'expires_at': expiresAt,
+            'scopes': {
+              'novel_full': {
+                'backend': 'remote',
+                'book_ids': ['book-1'],
+              },
+              'manga_chapter': {'backend': 'local'},
+            },
+          }),
+        ),
+        200,
+      );
+    });
+    final local = MockClient((request) async {
+      fail('local core was called: ${request.url}');
+    });
+    addTearDown(remote.close);
+    addTearDown(local.close);
+    final api = ApiClient(
+      client: local,
+      remoteClient: remote,
+      sourceRouter: SourceRouter(
+        config: const SourceRouterConfig(
+          remoteBaseUrl: 'https://source.example.invalid',
+          installToken: _testInstallToken,
+          installSigningKey: _testInstallSigningKey,
+        ),
+      ),
+    );
+
+    final policy = await api.fetchRemoteSourcePolicy();
+
+    expect(policy.expiresAt, expiresAt);
+    expect(
+      policy.runtimeConfig.backendFor(SourceRouteScope.novelFull),
+      SourceBackend.remote,
+    );
+    expect(
+      policy.runtimeConfig.allowsBook(SourceRouteScope.novelFull, 'book-1'),
+      isTrue,
+    );
+    final request = remoteRequests.single;
+    expect(request.method, 'GET');
+    expect(request.url.path, '/api/v1/client-policy');
+    expect(request.bodyBytes, isEmpty);
+    expect(request.url.query, isEmpty);
+    final timestamp = request.headers['X-FQ-Timestamp']!;
+    final nonce = request.headers['X-FQ-Nonce']!;
+    final bodyHash = sha256.convert(request.bodyBytes).toString();
+    final canonical =
+        'GET\n/api/v1/client-policy\n$timestamp\n$nonce\n$bodyHash';
+    final expected = Hmac(
+      sha256,
+      utf8.encode(_testInstallSigningKey),
+    ).convert(utf8.encode(canonical)).toString();
+    expect(request.headers['Authorization'], 'Bearer $_testInstallToken');
+    expect(request.headers['X-FQ-Signature'], 'v1=$expected');
+  });
+
   for (final stallsBody in [false, true]) {
     test(
       'timeout aborts stalled ${stallsBody ? 'body' : 'headers'} only',
